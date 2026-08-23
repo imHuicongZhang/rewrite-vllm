@@ -136,6 +136,36 @@ class Config:
     def max_tokens(self) -> int:
         return int(self.vllm["sampling"]["max_tokens"])
 
+    def check_gpu_arch(self, cc: str, gpu_name: str = "") -> tuple:
+        """Is this compute capability allowed for this workload?
+
+        Returns (ok, level, message) where level is 'ok' | 'warn' | 'fail'.
+        Enforced by preflight AND by every worker, because preflight can be skipped.
+        """
+        con = self.data["compute_constraints"]
+        allowed = [str(a) for a in con["allowed_gpu_arch"]]
+        majors = [int(m) for m in con.get("allowed_gpu_arch_major", [])]
+        reason = con.get("reason", "")
+        if cc in allowed:
+            return True, "ok", f"{gpu_name} {cc} allowed"
+        try:
+            major = int(cc.split("_")[1][:-1]) if len(cc.split("_")[1]) > 1 \
+                else int(cc.split("_")[1])
+        except (IndexError, ValueError):
+            major = -1
+        if major in majors:
+            return True, "warn", (
+                f"{gpu_name} reports {cc}, which is not explicitly in "
+                f"{allowed} but is the same architecture family. Allowed, but tell Wytro "
+                f"what card this is.")
+        return False, "fail", (
+            f"{gpu_name} is {cc}, which this workload does not allow (allowed: {allowed}"
+            + (f"; family {majors}" if majors else "") + f").\n"
+            f"  Reason: {reason}\n"
+            f"  Deselect this GPU in cluster.yaml compute.gpu_ids rather than widening the "
+            f"allow-list. If you believe the list is wrong, ask Wytro -- changing it "
+            f"changes what the experiment measures.")
+
     @property
     def text_column(self) -> str:
         return self.data["sharding"]["text_column"]
@@ -381,6 +411,14 @@ def load_config(config_root: Path | str | None = None) -> Config:
 
     cfg = Config(repo_root=repo_root, cluster=cluster, data=data, vllm=vllm, env=env,
                  paths=paths, arms=tuple(arms))
+
+    # ---- GPU architecture constraint ----
+    cc = data.get("compute_constraints")
+    if not cc or not cc.get("allowed_gpu_arch"):
+        stop("configs/data.yaml must define compute_constraints.allowed_gpu_arch. It is "
+             "part of the experiment definition, not an optional setting.")
+    if not all(str(a).startswith("sm_") for a in cc["allowed_gpu_arch"]):
+        stop("compute_constraints.allowed_gpu_arch entries must look like 'sm_100'")
 
     # ---- the job count is a hard assertion, not a comment ----
     n_jobs = sum(len(a.prompts) for a in arms if a.rewrite)

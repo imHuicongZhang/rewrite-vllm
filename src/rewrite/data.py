@@ -486,8 +486,9 @@ def verify_job(cfg: Config, job: JobSpec, deep: bool = False) -> JobStatus:
     This function is the audit, and it costs only n_shards small JSON reads.
 
     Checks:
-      1. shard-set coverage is exactly the manifest's shard set -- this is what catches a
-         prompt that only covered part of the corpus
+      1. shard-set coverage is exactly the manifest's shard set, in BOTH directions --
+         this is what catches a prompt that only covered part of the corpus. Missing
+         shards are named, not merely counted.
       2. per shard, n_rows_in == manifest rows == n_rows_out
       3. every sidecar's input_fingerprint matches the manifest (catches resume against
          a re-sharded input, which would have renumbered doc_id)
@@ -504,6 +505,13 @@ def verify_job(cfg: Config, job: JobSpec, deep: bool = False) -> JobStatus:
     if extra:
         problems.append(f"{len(extra)} output shard(s) with no matching input shard: "
                         f"{sorted(extra)[:5]}")
+    if missing:
+        shown = sorted(missing)[:10]
+        problems.append(
+            f"{len(missing)} of {len(expect)} shard(s) have no .done marker and were "
+            f"never completed: {shown}"
+            + (f" ... (+{len(missing) - len(shown)} more)" if len(missing) > len(shown) else "")
+            + f"  -- re-run this job to generate them")
 
     rows_out = out_tok = 0
     for si, d in sorted(got.items()):
@@ -528,7 +536,12 @@ def verify_job(cfg: Config, job: JobSpec, deep: bool = False) -> JobStatus:
                 problems.append(f"shard {si}: file has {n} lines, sidecar claims "
                                 f"{d.get('n_rows_out')}")
 
-    if not missing and not problems and rows_out != man.total_rows:
+    # Check #4, the required assertion. This used to be guarded by `not missing`, which
+    # made it dead code in precisely the case it exists for -- a short row count is exactly
+    # what missing shards cause. Missing shards are now reported above with their indices,
+    # and the total is checked whenever the shard set IS complete, which is the only
+    # situation where a discrepancy would otherwise go unexplained.
+    if not missing and rows_out != man.total_rows:
         problems.append(
             f"TOTAL row count {rows_out:,} != input row count {man.total_rows:,} for arm "
             f"{job.arm}. Every prompt must rewrite the ENTIRE dataset for its arm."

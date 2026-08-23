@@ -19,17 +19,45 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# --- ARGPARSE BEGIN (tests/test_integration.py extracts between these markers) ---
 STATUS_ONLY=0; SKIP_UPLOAD=0; SKIP_PREFLIGHT=0; FROM_JOB=1
-for a in "$@"; do
-  case "$a" in
+
+usage() {
+  sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# A `while` loop over "$@", not `for a in "$@"`. The `for` form snapshots the positional
+# list before the body runs, while `shift` always drops from the FRONT -- so after one
+# shift, "$1" is the original argument #2, not the argument following the flag. That made
+# `--from-job N` correct only when --from-job happened to be the first argument, and
+# `run_all.sh --status --from-job 5` set FROM_JOB to the literal string "--from-job".
+# Bash arithmetic then evaluated that bare word as 0 in `(( idx < FROM_JOB ))`, so instead
+# of erroring it silently ran all 12 jobs from job 1.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --status)         STATUS_ONLY=1 ;;
     --skip-upload)    SKIP_UPLOAD=1 ;;
     --skip-preflight) SKIP_PREFLIGHT=1 ;;
-    --from-job=*)     FROM_JOB="${a#*=}" ;;
-    --from-job)       shift; FROM_JOB="${1:-1}" ;;
-    *) ;;
+    --from-job=*)     FROM_JOB="${1#*=}" ;;
+    --from-job)
+      shift
+      [[ $# -gt 0 ]] || { echo "*** STOP: --from-job needs a job number." >&2; exit 2; }
+      FROM_JOB="$1" ;;
+    -h|--help)        usage; exit 0 ;;
+    # Unknown options used to be ignored, which is how a misparsed value slipped through
+    # unnoticed. Refuse instead.
+    *) echo "*** STOP: unknown option: $1" >&2
+       echo "    valid: --status --skip-upload --skip-preflight --from-job N|--from-job=N" >&2
+       exit 2 ;;
   esac
+  shift
 done
+
+if ! [[ "$FROM_JOB" =~ ^[1-9][0-9]*$ ]]; then
+  echo "*** STOP: --from-job must be a positive integer, got '$FROM_JOB'." >&2
+  exit 2
+fi
+# --- ARGPARSE END ---
 
 # ---------------------------------------------------------------------------
 # Config bootstrap, in two stages.

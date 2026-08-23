@@ -93,12 +93,21 @@ def main(argv=None) -> int:
     api = HfApi(token=token) if not args.dry_run else None
     private = bool(cfg.data["upload"]["private"])
 
-    # What actually gets uploaded. The .done sidecars and .tmp files are bookkeeping and
-    # must never reach the Hub; keeping this list in step with allow/ignore_patterns below
-    # is what makes the reported file count and byte total honest.
+    # What actually gets uploaded. Bookkeeping must never reach the Hub, and this list has
+    # to stay in step with allow/ignore_patterns below or the reported file count and byte
+    # total are lies.
+    #
+    # p.is_file() is load-bearing, not defensive: a shard CLAIM is a *directory*
+    # (part_NNNNN.claim/, created by data.try_claim), and Path.glob("part_*") yields
+    # directories. Without the check it survived this filter, .stat() reported the dirent
+    # size instead of a shard size, and -- worse -- huggingface_hub would have uploaded the
+    # file inside it, because fnmatch's "*" crosses "/", so "part_*" matches
+    # "part_99999.claim/owner.json". Verified against huggingface_hub.utils
+    # .filter_repo_objects. Claims only survive a hard-killed worker, but if one does, it
+    # silently ships.
     def payload(src: Path):
         return sorted(p for p in src.glob("part_*")
-                      if not p.name.endswith((".tmp", ".done")))
+                      if p.is_file() and not p.name.endswith((".tmp", ".done")))
 
     for job in jobs:
         name = repo_name(cfg, job)
@@ -126,7 +135,9 @@ def main(argv=None) -> int:
             repo_id=name, repo_type="dataset", folder_path=str(src),
             path_in_repo="data",
             allow_patterns=["part_*"],
-            ignore_patterns=["*.tmp", "*.done", ".joblock"],
+            # kept in step with payload() above; "*.claim/*" is what actually stops a
+            # leaked claim directory, since fnmatch "*" crosses "/"
+            ignore_patterns=["*.tmp", "*.done", "*.claim", "*.claim/*", ".joblock"],
             commit_message=f"{job.job_id}: {len(files)} shards"),
             f"upload_folder {name}")
 

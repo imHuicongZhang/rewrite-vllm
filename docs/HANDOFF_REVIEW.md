@@ -402,3 +402,399 @@ Recorded rather than silently resolved.
    `.tmp` name — so shards were written **uncompressed under a `.zst` name** and were
    unreadable afterwards. This would have destroyed a full run's output silently.
 2. `05_upload_to_hf.py` swept `.done` sidecars into its upload file list.
+
+---
+---
+
+# Addendum — 2026-08-23: review round 2 + Blackwell-only decision
+
+Everything above this line is the original record and is unchanged.
+
+Two inputs since: Wytro's decision that **all 12 jobs run on B200 + B300 only**, and an
+independent review by another Claude with no access to the source pipeline. This addendum
+answers the review item by item, delivers the C1 analysis, and records the Blackwell work.
+
+One correction to the review's premise: `main` had **2** commits (`d1a8628`, `7895e5f`),
+not 3. Its §C3 endorsement of dynamic shard claiming confirms it read `7895e5f`.
+
+---
+
+## A. Defects
+
+I re-derived all four testable items by execution rather than accepting them. Two were
+right but for the wrong reason, and in both cases the true mechanism is worse.
+
+### A1 — `.claim` directories reach the upload payload — **FIXED, and it was worse than reported**
+
+Verified, and then some. Beyond the payload filter, I checked what
+`huggingface_hub.utils.filter_repo_objects` actually does with the real library:
+
+```
+filter_repo_objects(names, allow_patterns=["part_*"],
+                    ignore_patterns=["*.tmp","*.done",".joblock"])
+  -> ['part_00000.jsonl.zst', 'part_99999.claim/owner.json']
+```
+
+So the file inside a leaked claim directory **would have been published to the Hub** at
+`data/part_99999.claim/owner.json`. The reason is that `fnmatch`'s `*` crosses `/`, so
+`part_*` matches the nested path and no ignore pattern touched it. The review flagged the
+payload count; the actual exposure was publication.
+
+Two further defects in the same block that the review did not catch:
+
+* `nbytes = sum(p.stat().st_size for p in files)` called `stat()` on a **directory**,
+  returning the dirent size (typically 4096) — so the reported GiB total was wrong.
+* `len(files)` counted the directory as one entry while HF would upload a file *inside* it,
+  so both the printed file count and the commit message were wrong.
+
+That block's own comment promises the count and byte total are honest. They were not.
+
+Fixed three ways, so the failure needs all three to regress: `p.is_file()` in `payload()`
+(excludes it at source and repairs the byte total), `"*.claim"` **and** `"*.claim/*"` in
+`ignore_patterns` (the second is the one that actually matters, given fnmatch semantics),
+and a regression test that asserts against the real `filter_repo_objects`.
+
+### A2 — missing shards computed but never reported — **FIXED, and the real defect is deeper**
+
+The review's framing suggests a job could look healthy while shards are missing. That part
+is **not** right: `missing` still feeds `state`, so the job reports `PARTIAL`, and every
+consumer keys off `state`. `postprocess.trim_job` refuses to trim, `--verify` exits 1, and
+`run_all.sh` will not skip it. Nothing silently proceeds.
+
+The genuine defect is worse in a different way. The final guard read:
+
+```python
+if not missing and not problems and rows_out != man.total_rows:
+```
+
+That `not missing` conjunct made **check #4 — documented in the docstring as "the required
+assertion" — dead code in exactly the situation it exists for.** Missing shards are the
+principal cause of a short row count, and the guard excluded that case by construction. The
+"every prompt rewrites the ENTIRE dataset" invariant, which is the single most important
+property in this repo, had no reachable assertion behind it at job level.
+
+Fixed: missing shards now raise a problem naming the count and the first ten indices, and
+the total check became `if not missing and rows_out != total` — reachable whenever the
+shard set is complete, which is the only case where a discrepancy would otherwise be
+unexplained. Docstring corrected.
+
+Consequence for the guide: the troubleshooting row promising `--verify --deep-verify`
+"prints exactly which shards disagree" is now true rather than aspirational. I tightened it
+to "missing or disagree" for precision.
+
+### A3 — stale module reference — **FIXED**
+
+`configs/data.yaml:28` said `rewrite.verify.verify_job()`; there is no such module. Now
+`rewrite.data.verify_job()`. Plain error on my part.
+
+### A4 — `run_all.sh --from-job N` — **FIXED; the review's diagnosis was wrong and the real bug is worse**
+
+"Never works" is **false**, and the stated mechanism is not the mechanism.
+
+Measured, by extracting the parser and running every form:
+
+| invocation | old FROM_JOB | new |
+|---|---|---|
+| `--from-job=5` | `5` | `5` |
+| `--from-job 5` | **`5`** | `5` |
+| `--skip-upload --from-job 5` | `--from-job` | `5` |
+| `--from-job 5 --skip-upload` | `5` | `5` |
+| `--status --from-job 5` | `--from-job` | `5` |
+
+It worked **iff `--from-job` was the first argument**. The cause is not that "`shift` does
+not advance the loop variable" — it is that `shift` always drops from the **front** of the
+positional list, so after one shift `$1` is the original argument **#2**, whatever that
+happens to be. With `k` flags before `--from-job`, you get argument `k+2`; with `k=0` that
+is accidentally the right value.
+
+The part neither of us flagged initially is the downstream behaviour. `FROM_JOB` is used in
+`(( idx < FROM_JOB ))`, and bash arithmetic evaluates the bare word `--from-job` as
+`-(-(from - job))` with both names unset — that is, **`0`**. So a misparse did not error;
+`run_all.sh --status --from-job 5` silently ran **all 12 jobs from job 1**. Idempotent
+thanks to the `.done` sidecars, so the cost is wasted wall-clock rather than bad data — but
+at this scale that could be days.
+
+Rewritten as a `while [[ $# -gt 0 ]]` loop, with `FROM_JOB` validated as a positive integer
+and **unknown options rejected**. Silently ignoring unknown options is what let a
+mis-consumed value pass as a flag in the first place. Regression test covers six valid
+forms and four malformed ones.
+
+### A5 — guide section order — **FIXED**
+
+Confirmed 2.1, 2.2, **2.5**, 2.3, 2.4. Renumbered so the order is now 2.1 paths → 2.2
+compute → **2.3 GPU architecture** → 2.4 env → 2.5 `.env`, with all cross-references
+updated. The section stays adjacent to `compute` because it is about `gpu_ids`, which is
+where a reader needs it.
+
+---
+
+## B. Answers
+
+### B1 — commit the verification harnesses — **DONE, with one design tension resolved**
+
+Committed under `tests/`, plus `tests/README.md`.
+
+The tension: design constraint 1 forbids JHU-specific paths in shipped code, but the two
+parity tests must reach the source pipeline. Resolved by making `--source-root` a
+**required argument with no default**; both tests exit **77** with an explanation when it
+is absent. So they are committed, runnable on the cluster where the source still exists,
+and contain no path that pins this repo to one machine.
+
+| file | needs | last run |
+|---|---|---|
+| `tests/test_trim_parity.py` | `--source-root` | 72,443 comparisons, 0 mismatches, 9/9 constants equal |
+| `tests/test_shuffle_parity.py` | `--source-root` | identical text and identical row order over 63,000 rows |
+| `tests/test_integration.py` | nothing | ~100 checks, 0 failures |
+| `scripts/verify_prompt_parity.py` | a local model dir | 12/12 prompts |
+
+All four re-run and pass against the current tree.
+
+### B2 — standalone prompt-parity check — **DONE**
+
+`scripts/verify_prompt_parity.py`. Needs only `transformers`, `PyYAML` and a local model
+directory: no cluster config, no filled placeholders, no GPU, no vLLM, no network. Reads
+expected values from `configs/data.yaml`, so it cannot drift from what the workers assert
+at runtime, and it checks structure (`[TEXT]` count, the wrap `\n\nPassage:\n` suffix) as
+well as the token count. Output on the real tokenizer:
+
+```
+quality-first/p1  p1_wiki     150  150  ok      wrap-inspired/p1  wrap_easy  72  72  ok
+quality-first/p2  p2_distill  185  185  ok      wrap-inspired/p2  wrap_hard  66  66  ok
+...                                             wrap-inspired/p3  wrap_wiki  73  73  ok
+PASS -- all 12 job prompts match their expected templated overhead.
+```
+
+It also prints provenance, so a reader sees which numbers are copies and which are
+reconstructions.
+
+### B3 — do the dropped columns need a pass-through? — **No. Join later on `doc_id`.**
+
+The review asked whether `source_text_sha1` is sufficient to rejoin. **It is the wrong key
+and I should not have implied otherwise.** Identical documents produce identical hashes,
+and web corpora contain exact duplicates — so a sha1 join is ambiguous precisely where it
+matters. Use `doc_id`, which is already in every output row.
+
+That is not a workaround; it is the source's own convention.
+`10_postprocess/README.md:18` states *"`doc_id` is the canonical identity key"*, and the
+selection scripts reference `doc_id` 41 times versus 14 for `tokens-llama2` and 5 for
+`fasttext-ranking-v2`. Our output rows carry `arm`, `prompt_id` and `doc_id`; the sharded
+input under `data_root/shards/<arm>/` carries `doc_id` alongside the text. The join is a
+local key lookup.
+
+What the change *would* have been, since you asked: carry extra columns through
+`shard_arm()` into the shard parquet and echo them into each output row. Cost, using the
+source's own figures (~1e9 output rows across the 12 jobs, ~110 bytes of JSON for the four
+columns): roughly **110 GB uncompressed, ~30 GB after zstd — about 4%** of output volume.
+So "expensive" in my original §8.3 was overstated; it is affordable. I still recommend
+against it, for three reasons:
+
+1. **It may be a no-op.** Those columns are derived artifacts of the JHU selection
+   pipeline. Whether the HF-hosted datasets carry them at all is unknown — `text` is the
+   only column this package requires. If they are absent upstream, a pass-through cannot
+   invent them, and the join cannot be done afterwards either.
+2. **It writes each value 2–4 times.** Storing them in the input shards instead costs one
+   copy per arm rather than one per (arm, prompt) — strictly cheaper and equally joinable.
+3. **It widens the output schema you specified**, days before handoff, to buy something a
+   key lookup already provides.
+
+**One consequence I added to the guide:** do not delete `data_root/shards/` when the run
+finishes. It is the join table. If it is lost the join is still recoverable — re-download
+and re-shard with the same parameters, and the manifest fingerprint will verify you got the
+same `doc_id` assignment — but that is hours of work to avoid a `rm`.
+
+If you want the belt-and-braces version, the cheap form is a `sharding.carry_columns` list
+that copies any of the four into the input shards when present. Say the word; it is small
+and I would rather add it deliberately than guess.
+
+### B4 — tokenizer batching vs `TOKENIZERS_PARALLELISM=false` — **my §3.7 claim was wrong**
+
+The review was right to be suspicious. Measured on real documents from the source's own
+monitor log, single core, `TOKENIZERS_PARALLELISM=false`:
+
+```
+corpus: 4000 real docs, 10.1 M chars, 2.05 M tokens
+  batched call      : 3.709s  -> 0.55 M tok/s
+  per-document loop : 3.844s  -> 0.53 M tok/s
+  batching speedup  : 1.04x
+```
+
+**1.04×, not "the difference between minutes and hours".** `HANDOFF_REVIEW` §3.7 overstated
+this and is corrected here. With the Rust tokenizer single-threaded, HF's fast tokenizer
+already amortises per-call Python overhead; batching buys almost nothing.
+
+Is tokenization a throughput bottleneck? **No.** Projecting onto one arm-pass (9.5B
+templated input + 3.6B output tokens, source's own figures):
+
+| generation speed | tokenization share of wall clock |
+|---|---|
+| 2,000 tok/s/GPU | 1.3% |
+| 4,000 tok/s/GPU | 2.6% |
+| 8,000 tok/s/GPU | 5.0% |
+
+Even on fast Blackwell cards it stays a rounding error, and the share is independent of
+worker count since both scale together.
+
+**Did the source set it false at tokenization time, or only around generation?** Settled
+from the source: `rewrite_worker.py:32` sets it, the tokenizer loads at `:190`, and
+tokenization happens at `:222` and `:285`. It was false during **all** tokenization. Source
+parity confirmed — the value stays, exactly as the review instructed.
+
+Batching stays too: identical values (preflight's `--verify-tokenizer-batching` proves it
+on 1,000 real documents), marginally faster, already tested. What changes is the claim, not
+the code. No measurement instruction added to the guide — at 1.3–5% there is nothing
+actionable to measure.
+
+### B5 — anything in §A wrong
+
+Two, both above: **A2**'s severity framing (jobs do report `PARTIAL`; the real defect is
+that the required assertion was unreachable) and **A4**'s "never works" plus its stated
+mechanism (it worked when `--from-job` came first; `shift` drops from the front; and the
+downstream consequence is a silent full re-run, not a failure). Both defects are real and
+both are fixed — the corrections concern diagnosis, not whether to act.
+
+---
+
+## C1. Analysis only — nothing changed
+
+Per instruction I did **not** restore `assign_wrap_styles`, add a mode switch, or touch
+`data.yaml`. Analysis follows, from the source run's own per-arm counters.
+
+### Arm-level output tokens
+
+Source design, as it actually ran (pass 1 + distill, both complete):
+
+| arm | pass 1 | distill | total | copies/doc |
+|---|---:|---:|---:|:--:|
+| quality-first | 3.399B | 2.581B | 5.981B | 2 |
+| diversity-first | 3.812B | 2.845B | 6.657B | 2 |
+| signal-disagreement-λ05 | 3.649B | 2.750B | 6.400B | 2 |
+| **wrap** | 4.313B | 3.657B | **7.970B** | **2** |
+| rewrite (ReWire) | 9.256B | 7.320B | 16.576B | 2 |
+
+The source was **symmetric at 2 copies per document across every arm, wrap included.**
+
+Under the current design, wrap-inspired is four full style passes and has no distill pass.
+Per-style output per document, from the source's own status-2 assembly figures — easy 223,
+hard 530, wiki 364, qa 457 tokens — sums to ~1,574 tokens/doc across all four styles. Over
+wrap's 10,604,458 documents:
+
+| arm | passes | pool tokens | copies/doc |
+|---|:--:|---:|:--:|
+| quality-first | 2 | 5.98B | 2 |
+| diversity-oriented | 2 | 6.66B | 2 |
+| disagreement-aware | 2 | 6.40B | 2 |
+| **wrap-inspired** | **4** | **≈16.7B** | **4** |
+| rewire-inspired | 2 | 16.58B | 2 |
+| quality-base | 0 | — (raw) | 1 |
+
+So wrap's pool is ~2.6× the other small arms' and ~4× what the source's wrap pass produced.
+Note rewire-inspired reaches a similar token total at 2 copies/doc — its size comes from
+having 21.2M documents, not from more passes.
+
+### The repetition asymmetry — real at pool level, and it inverts at fixed budget
+
+At full-pool level the review is right: 4 copies/doc versus 2.
+
+But arms are not used as whole pools; they are cut to a token budget (the source cut every
+arm to 5B rewritten tokens). Under **uniform** subsampling to a common budget `B`, expected
+copies per document is `n_passes × B / P`, and since the pool `P ≈ n_passes × T × D`, that
+reduces to `B / (T × D)` — **independent of pass count.** More passes give a larger pool,
+so the same budget is met with a smaller fraction of it.
+
+Concretely, at `B` = 5B tokens:
+
+| arm | pool | fraction needed | expected copies/doc |
+|---|---:|---:|:--:|
+| quality-first | 5.98B | 84% | **1.67** |
+| disagreement-aware | 6.40B | 78% | 1.56 |
+| diversity-oriented | 6.66B | 75% | 1.50 |
+| **wrap-inspired (4 passes)** | 16.7B | 30% | **1.20** |
+| wrap under the source design | 7.97B | 63% | 1.25 |
+
+Under uniform sampling the four-pass design gives wrap **less** duplication than
+quality-first, not more. The direction of the review's concern is inverted here, and the
+arm most constrained is actually quality-first, whose pool barely exceeds the budget and is
+therefore nearly forced to its full 2 copies/doc.
+
+**Where the concern does bite:** non-uniform selection. The source assembled by taking
+*all* status-2 pass-1 output first and topping up from distill, sorted by quality — under
+that rule a four-pass pool behaves differently and could concentrate. Notably the source
+was already alert to this: for wrap specifically it used a **seeded random** supplement
+rather than a quality sort, recorded in its manifest as
+`"distill_selection": "seeded_random_seed42_no_quality_sort"`, explicitly to preserve the
+arm-2-vs-arm-4 comparison.
+
+### What "wrap-inspired" should mean, and my recommendation
+
+The source rephrased **each document once**, with the style varied across the corpus by a
+seeded RNG. Four full passes asks a different question: *every document rephrased four
+ways.* Both are defensible; they are not the same experiment. I have not verified which the
+WRAP paper does — the source cites arXiv:2401.16380 Appendix G for the prompt *text* only,
+and I would not assert more than that without reading it.
+
+**Recommendation: keep four passes.** The decisive argument is that it is a strict
+**superset**. Having all four styles for every document, you can recover the source's
+one-style-per-document design afterwards by selecting one pass per document — at zero
+generation cost. The reverse requires regenerating three quarters of the arm. The costs are
+2× wrap compute versus the source, and an obligation to decide duplication at assembly
+time rather than inheriting it.
+
+Two caveats if you take that route. Our shard indices differ from the source's, so a
+post-hoc style assignment would be equivalent-but-not-identical to the original seeded one.
+And whoever assembles the final datasets should **compute and report copies-per-document
+per arm** rather than assuming symmetry — the table above shows the answer is not obvious
+in either direction.
+
+**Changed for C1: nothing.**
+
+---
+
+## The Blackwell-only decision
+
+All 12 jobs now run on **B200 (`sm_100`) and B300 (`sm_103`) only**; H200 is excluded. This
+supersedes divergence 0 above, which described a balanced H200+Blackwell mixture as the
+mitigation. Restricting to one architecture family removes the confound rather than
+balancing it, which is strictly better.
+
+Enforced in three places, because the constraint is only as good as its weakest bypass:
+
+* `configs/data.yaml` gains `compute_constraints.allowed_gpu_arch: [sm_100, sm_103]` with
+  an `allowed_gpu_arch_major: [10]` fallback, so a Blackwell variant reporting an
+  unanticipated capability is allowed with a warning while a Hopper (major 9) is not. It
+  lives in `data.yaml` because it is an experimental-design decision, not a machine setting.
+* `preflight.py` fails on any disallowed card and prints the steps to select only the
+  Blackwell ones.
+* **Every worker refuses on its own, before building the engine.** This is the one that
+  matters: preflight can be skipped with `--skip-preflight`, and `03_run_job.sh` can be
+  invoked directly. Generating even one shard on the wrong architecture would contaminate
+  an arm silently.
+
+`gpu_name`/`gpu_cc` stay in every sidecar — B200 and B300 are still two capabilities, so
+the record remains worth having.
+
+**Still unverified, and only answerable on his machine:** whether `torch 2.11.0+cu130` /
+`vllm 0.22.0` / `flashinfer 0.6.11.post2` carry working `sm_100` and `sm_103` kernels.
+CUDA 13 supports both and `sm_103` should at worst PTX-JIT from `sm_100`, but there is no
+Blackwell card here. `preflight.py` compares each device against
+`torch.cuda.get_arch_list()` and reports native / JIT / **no kernels** (hard fail), and
+`00_setup_env.sh` runs a real one-prompt generation. Between them the question is settled
+in minutes, and both refuse to let anyone "fix" a gap by installing a different build.
+
+---
+
+## What the review got wrong about the code
+
+1. **A2 severity** — jobs do not silently report `DONE`; `state` becomes `PARTIAL` and
+   every consumer gates on it. The real defect was the unreachable assertion.
+2. **A4 mechanism and scope** — it worked when `--from-job` was first; the cause is
+   front-shifting, not the loop variable; and the consequence was a silent full re-run
+   rather than a no-op.
+3. **A1 was understated** — the file inside a leaked claim directory would have been
+   published to the Hub, not merely counted, and two adjacent reporting defects went
+   unnoticed.
+4. **`main` had 2 commits, not 3.**
+5. **`source_text_sha1` was described as the potential rejoin key** (following my own
+   framing in §8.3). `doc_id` is the key; sha1 cannot disambiguate duplicate documents.
+
+Everything else the review asserted about the code was accurate, and the four items it
+endorsed under §C3 are unchanged.

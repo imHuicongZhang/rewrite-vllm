@@ -146,40 +146,53 @@ def c3_gpus(cfg, args) -> bool:
     ok(f"estimated KV cache on the SMALLEST card after ~14.2 GiB of bf16 weights: "
        f"~{kv:.1f} GiB")
 
-    # ---- heterogeneous fleet: allowed, but it has to be understood and recorded ----
-    if len(archs) > 1 or len(models) > 1:
-        print()
-        warn("MIXED GPU FLEET DETECTED:")
-        for name, idxs in sorted(models.items()):
-            cc = f"sm_{torch.cuda.get_device_properties(idxs[0]).major}" \
-                 f"{torch.cuda.get_device_properties(idxs[0]).minor}"
-            print(f"          {len(idxs)}x {name} ({cc}) -> GPUs {idxs}")
-        print("""
-     This is supported, and compute.shard_assignment: dynamic (the default) will keep the
-     fast cards busy instead of running at the slowest card's pace.
+    # ---- ARCHITECTURE ALLOW-LIST: Blackwell only (B200 sm_100 / B300 sm_103) ----
+    # This is a workload constraint from configs/data.yaml, not a machine setting. The
+    # original data was generated on H100 (sm_90) with FlashAttention v3, which is
+    # Hopper-only; vLLM picks a different attention backend on Blackwell, and greedy
+    # decoding at temperature=0 is not bitwise identical across architectures. Restricting
+    # every job to one architecture family removes that confound entirely.
+    print()
+    con = cfg.data["compute_constraints"]
+    allowed_idx, rejected = [], []
+    for i in range(n):
+        pr = torch.cuda.get_device_properties(i)
+        cc = f"sm_{pr.major}{pr.minor}"
+        okk, level, msg = cfg.check_gpu_arch(cc, pr.name)
+        if okk and level == "ok":
+            ok(f"GPU {i}: {msg}")
+            allowed_idx.append(i)
+        elif okk:
+            warn(f"GPU {i}: {msg}")
+            allowed_idx.append(i)
+        else:
+            good = fail(f"GPU {i}: {msg}")
+            rejected.append(i)
 
-     But understand what it means for the science. The original data was generated on
-     H100 (sm_90) using FlashAttention v3, which is Hopper-only; on Blackwell vLLM picks a
-     different attention backend. Greedy decoding at temperature=0 is NOT bitwise identical
-     across architectures -- an argmax can flip on a near-tie and the rest of a generation
-     diverges from there. So:
-
-       * Every shard's .done sidecar records gpu_name and gpu_cc. That is what makes the
-         mixture auditable afterwards; do not delete the sidecars.
-       * Run every job on the SAME GPU set. Jobs are sequential and each uses all GPUs, so
-         every arm then sees the same hardware mixture and the confound is BALANCED across
-         arms rather than segregated into one of them. Changing compute.gpu_ids partway
-         through the 12 jobs is the thing that would actually bias the comparison.
-       * If you want the cleanest result and can afford it, run all 12 jobs on one
-         architecture. That is Wytro's call, not yours.""")
+    if rejected:
+        # CUDA_VISIBLE_DEVICES has already remapped indices, so tell him what to do in
+        # terms he can act on rather than printing a list that may not match nvidia-smi.
         print()
+        print("     This workload runs on Blackwell only. Restrict the run to the allowed "
+              "cards:")
+        print("       1. nvidia-smi --query-gpu=index,name,compute_cap --format=csv")
+        print(f"       2. in configs/cluster.yaml set gpu_ids to just the "
+              f"{sorted(con['allowed_gpu_arch'])} cards,")
+        print(f"          and set num_gpus to how many that is")
+        print("       3. re-run preflight")
+        print("     Do NOT widen compute_constraints.allowed_gpu_arch in data.yaml to make "
+              "this pass -- that is Wytro's experimental design, not a setting.")
+
+    if len(archs) > 1:
+        print()
+        warn(f"more than one compute capability in use: {sorted(archs)}")
+        print("     Allowed (B200 and B300 are both Blackwell and share an attention "
+              "backend), but every shard's .done sidecar records gpu_name and gpu_cc so "
+              "the mixture stays auditable. Do not delete the sidecars, and do not change "
+              "compute.gpu_ids partway through the 12 jobs.")
     else:
-        ok(f"homogeneous fleet: {n}x {list(models)[0]}")
+        ok(f"single architecture across all {n} GPU(s): {list(archs)[0]}")
 
-    if any(int(a.split('_')[1]) >= 100 for a in archs if a.startswith('sm_')):
-        warn("Blackwell-class GPU present. The original run used FlashAttention v3 "
-             "(Hopper-only); vLLM will select a different backend here. Expected, and "
-             "recorded per shard -- but it is a real difference from the source run.")
     return good
 
 

@@ -123,17 +123,28 @@ if [ "$NARCH" -gt 1 ]; then
   cat <<'MIXED'
 
    NOTE: this node has MORE THAN ONE GPU ARCHITECTURE.
-   That is supported. Leave compute.shard_assignment as "dynamic" in configs/cluster.yaml
-   so the faster cards are not held back by the slower ones.
-   It does have a consequence for the science -- preflight.py explains it in full, and
-   every shard records which GPU produced it. Read that section before starting the run.
+   B200 (sm_10.0) and B300 (sm_10.3) together are fine -- both are Blackwell.
+   Leave compute.shard_assignment as "dynamic" so the faster cards are not held back.
+   Every shard records which GPU produced it. preflight.py has the details.
 MIXED
 fi
+
+case "$ARCHS" in *9.0*|*8.*|*7.*)
+  cat <<'HOPPER'
+
+   NOTE: a pre-Blackwell GPU (H100/H200/A100/L40S class) is present on this node.
+   This workload is restricted to Blackwell (B200 sm_10.0 / B300 sm_10.3) by
+   configs/data.yaml, and preflight.py will REFUSE to start if a non-Blackwell card is
+   selected. Set compute.gpu_ids in configs/cluster.yaml to just the Blackwell cards.
+   Do not widen the allow-list -- it is Wytro's experimental design, not a setting.
+HOPPER
+  ;;
+esac
 
 case "$ARCHS" in *10.*|*11.*|*12.*)
   cat <<'BLACKWELL'
 
-   NOTE: a Blackwell-class GPU (sm_100 / sm_103 / sm_120) is present.
+   NOTE: Blackwell detected (B200 sm_10.0 / B300 sm_10.3) -- this is the target.
    The original data was generated on H100 (sm_90) with FlashAttention v3, which is
    Hopper-only; vLLM will choose a different attention backend on these cards. Expected,
    and recorded per shard. Step 5 below runs a real generation, which is what proves the

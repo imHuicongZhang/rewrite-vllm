@@ -25,11 +25,39 @@
 expected_jobs: 12          # hard-asserted against the enumeration below
 
 semantics:
-  # See the note above. Enforced by rewrite.verify.verify_job().
+  # See the note above. Enforced by rewrite.data.verify_job().
   # NOTE: this DIFFERS from the source pipeline, where the wrap arm assigned ONE of four
   # styles per document via np.random.default_rng([42, shard_index]) -- a single pass, not
   # four. Deliberate change; see docs/HANDOFF_REVIEW.md.
   full_cross_product: true
+
+# ---------------------------------------------------------------------------------------
+# GPU ARCHITECTURE CONSTRAINT -- Wytro's decision, not Tianjian's. Not a placeholder.
+#
+# All 12 jobs run on Blackwell only: B200 (sm_100) and B300 / Blackwell Ultra (sm_103).
+# H200 (Hopper, sm_90) is deliberately EXCLUDED even if present on the node.
+#
+# Why this is enforced in code rather than written in a README: the source data was
+# generated on H100 with FlashAttention v3, which is Hopper-only, and vLLM selects a
+# different attention backend on Blackwell. Greedy decoding at temperature=0 is not
+# bitwise identical across architectures -- an argmax can flip on a near-tie and the rest
+# of that generation diverges. Mixing Hopper and Blackwell across the 12 jobs would
+# confound "which arm" with "which GPU", which is exactly the comparison the experiment
+# exists to make. Restricting to one architecture family removes the confound entirely.
+#
+# B200 and B300 are both Blackwell, so they share an attention backend and their numerics
+# are close; the residual difference between sm_100 and sm_103 is accepted, and every
+# shard records which card produced it (gpu_cc in its .done sidecar) either way.
+#
+# preflight.py refuses to start, and every worker refuses to run, on a GPU outside this
+# set. Do not widen it to work around a hardware problem -- ask Wytro.
+compute_constraints:
+  allowed_gpu_arch: [sm_100, sm_103]      # B200, B300
+  # A card whose exact capability is not listed but whose MAJOR version is in this list is
+  # allowed with a warning. That covers a Blackwell variant reporting e.g. sm_101 without
+  # silently letting a Hopper (major 9) or Ada (major 8) card in.
+  allowed_gpu_arch_major: [10]
+  reason: "Blackwell only (B200/B300); H200 excluded to avoid confounding arm with GPU architecture"
 
 sharding:
   text_column: text

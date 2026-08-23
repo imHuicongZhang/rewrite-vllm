@@ -178,6 +178,24 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
         # Load the model only when there is real work -- a fully-resumed job must not pay
         # 12 x N model loads to discover it has nothing to do.
         if llm is None:
+            # ARCHITECTURE GUARD. preflight checks this too, but preflight can be skipped
+            # (run_all.sh --skip-preflight) and 03_run_job.sh can be invoked directly, so
+            # the worker refuses on its own. Generating even one shard on a disallowed
+            # architecture would silently contaminate the arm.
+            try:
+                import torch as _torch
+                _pr = _torch.cuda.get_device_properties(0)
+                _cc = f"sm_{_pr.major}{_pr.minor}"
+                _okk, _lvl, _msg = cfg.check_gpu_arch(_cc, _torch.cuda.get_device_name(0))
+                if not _okk:
+                    stop(f"[w{worker_id}] refusing to run: {_msg}")
+                if _lvl == "warn":
+                    log(f"[w{worker_id}] WARNING: {_msg}")
+            except SystemExit:
+                raise
+            except Exception as _e:
+                log(f"[w{worker_id}] WARNING: could not check GPU architecture ({_e})")
+
             llm = E.build_llm(cfg)
             try:
                 import torch
