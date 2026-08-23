@@ -311,6 +311,11 @@ def load_config(config_root: Path | str | None = None) -> Config:
         stop(f"cluster.yaml compute.gpu_ids has {len(list(g))} entries but "
              f"num_gpus is {n_gpus}")
 
+    sa = cluster["compute"].get("shard_assignment", "dynamic")
+    if sa not in ("dynamic", "static"):
+        stop("cluster.yaml compute.shard_assignment must be 'dynamic' or 'static'")
+    cluster["compute"]["shard_assignment"] = sa
+
     if cluster["runtime"]["output_compression"] not in ("zstd", "none"):
         stop("cluster.yaml runtime.output_compression must be 'zstd' or 'none'")
     if cluster["scheduler"]["kind"] not in ("bash", "slurm"):

@@ -96,7 +96,16 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
     if len(all_shards) != man.n_shards:
         stop(f"{job.arm}: found {len(all_shards)} shards on disk but the manifest says "
              f"{man.n_shards}. Re-run scripts/02_download_data.py.")
-    owned = D.owned_shards(all_shards, worker_id, num_workers)
+    assignment = cfg.cluster["compute"].get("shard_assignment", "dynamic")
+    if assignment == "static":
+        # Source parity: shard_index % num_workers == worker_id. Perfectly balanced only
+        # when every GPU is identical. (07_rewrite/rewrite_worker.py:197-203)
+        owned = D.owned_shards(all_shards, worker_id, num_workers)
+    else:
+        # Dynamic: this worker will claim shards as it frees up, so a mixed
+        # H200/B200/B300 fleet self-balances instead of running at the slowest card's
+        # pace. `owned` is the candidate list; claiming happens in the loop.
+        owned = list(all_shards)
     if limit_shards:
         owned = owned[:limit_shards]
 
@@ -106,11 +115,18 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
         log(f"[w{worker_id}] removed {n_cleaned} stale .tmp file(s)")
 
     log(f"[w{worker_id}] {job.job_id} mode={job.prompt.mode} trim={job.prompt.trim} "
-        f"owns {len(owned)}/{len(all_shards)} shards")
+        + (f"owns {len(owned)}/{len(all_shards)} shards (static)"
+           if assignment == "static"
+           else f"claiming from {len(all_shards)} shards (dynamic)"))
 
     already = sum(1 for si, _ in owned
                   if D.sidecar_path(job.output_dir /
                                     f"part_{si:05d}{cfg.shard_suffix}").exists())
+    if assignment != "static":
+        # every worker sees the whole list, so "total" is the job, not a private slice
+        already = sum(1 for si, _ in all_shards
+                      if D.sidecar_path(job.output_dir /
+                                        f"part_{si:05d}{cfg.shard_suffix}").exists())
     prog = {
         "job_id": job.job_id, "arm": job.arm, "prompt_id": job.prompt.id,
         "worker_id": worker_id, "shards_completed": already, "shards_total": len(owned),
@@ -122,14 +138,21 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
                      f"progress_w{worker_id}.json")
     progress_path.parent.mkdir(parents=True, exist_ok=True)
 
+    owner = {"worker_id": worker_id, "pid": os.getpid(),
+             "host": __import__("socket").gethostname(),
+             "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    claimed = None
+
     llm = None
     gpu_name = "?"
+    gpu_cc = "?"
     t_start = time.perf_counter()
     processed_docs = 0
     processed_out_tokens = 0
     every = int(cfg.cluster["runtime"]["progress_log_every_shards"])
 
-    for si, shard_path in owned:
+    try:
+      for si, shard_path in owned:
         out_path = job.output_dir / f"part_{si:05d}{cfg.shard_suffix}"
         done_path = D.sidecar_path(out_path)
 
@@ -142,6 +165,16 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
             done_path.unlink()
         # A data file with no sidecar is INCOMPLETE by definition and is overwritten.
 
+        if assignment != "static":
+            if not D.try_claim(job.output_dir, si, owner):
+                continue                      # another worker has it
+            # Re-check after winning the claim: a worker may have finished this shard
+            # between our .done test above and the claim succeeding.
+            if done_path.exists():
+                D.release_claim(job.output_dir, si)
+                continue
+            claimed = si
+
         # Load the model only when there is real work -- a fully-resumed job must not pay
         # 12 x N model loads to discover it has nothing to do.
         if llm is None:
@@ -149,6 +182,10 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
             try:
                 import torch
                 gpu_name = torch.cuda.get_device_name(0)
+                _p = torch.cuda.get_device_properties(0)
+                gpu_cc = f"sm_{_p.major}{_p.minor}"
+                owner["gpu_name"] = gpu_name
+                owner["gpu_cc"] = gpu_cc
             except Exception:
                 pass
 
@@ -213,8 +250,17 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
             "n_output_tokens_llama2": sum_l2,
             "bytes": out_path.stat().st_size, "elapsed_s": round(dt, 2),
             "drop_threshold": drop_threshold, "prompt_overhead": overhead,
+            # WHICH GPU produced these rows. On a mixed H200/B200/B300 fleet the attention
+            # backend and reduction order differ by architecture, so greedy output can
+            # differ slightly between cards. Recording it here is the only way to
+            # reconstruct that after the fact -- see docs/HANDOFF_REVIEW.md.
+            "gpu_name": gpu_name, "gpu_cc": gpu_cc,
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         })
+
+        if claimed is not None:
+            D.release_claim(job.output_dir, claimed)   # .done is now the marker
+            claimed = None
 
         prog["shards_completed"] += 1
         prog["docs_completed"] += n_rows
@@ -244,8 +290,13 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
                 f"out_tok={sum_out} tok/s={tps:.0f} docs/s={dps:.1f} "
                 f"ETA={eta_s/3600:.1f}h GPU={gpu_name}")
 
+    finally:
+        # A crash mid-shard must not leave a claim nobody will ever complete.
+        if claimed is not None:
+            D.release_claim(job.output_dir, claimed)
+
     log(f"[w{worker_id}] {job.job_id} ALL OWNED SHARDS DONE "
-        f"({prog['shards_completed']}/{prog['shards_total']})")
+        f"({prog['shards_completed']}/{prog['shards_total']}) GPU={gpu_name} {gpu_cc}")
     return 0
 
 
@@ -285,6 +336,9 @@ def main(argv=None) -> int:
                     help="verify one job's row conservation and exit")
     ap.add_argument("--deep-verify", action="store_true",
                     help="with --verify: also count lines in every output shard")
+    ap.add_argument("--reap-claims", action="store_true",
+                    help="clear shard claims left by a dead run. The launcher calls this "
+                         "ONCE before starting workers; never run it while workers are up")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config_root)
@@ -296,6 +350,10 @@ def main(argv=None) -> int:
     if not args.arm or not args.prompt_id:
         ap.error("--arm and --prompt-id are required (or use --status)")
     job = get_job(cfg, args.arm, args.prompt_id)
+
+    if args.reap_claims:
+        D.reap_stale_claims(job.output_dir)
+        return 0
 
     if args.verify:
         st = D.verify_job(cfg, job, deep=args.deep_verify)

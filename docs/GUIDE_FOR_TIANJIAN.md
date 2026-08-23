@@ -36,6 +36,9 @@ logs a live tok/s and ETA. Assume days-to-weeks, and assume **it will be interru
 times**. That is fine: everything resumes at shard granularity. Re-running the same
 command is always the correct recovery action.
 
+If your GPUs are not all the same model — H200 + B200 + B300, say — that is supported,
+but read **§2.5** before you start. It affects both speed and the validity of the results.
+
 **What you must supply:** eleven values in `configs/cluster.yaml` and one token in `.env`.
 That is all. Section 2 lists every one.
 
@@ -76,6 +79,7 @@ are expanded automatically, so `"${repo_root}/logs"` is a valid value.
 | `num_gpus` | `nvidia-smi --list-gpus \| wc -l`. Use every GPU you are entitled to — see §4 if the node is shared. |
 | `gpu_ids` | leave as `auto` (means `0..num_gpus-1`). Only set an explicit list like `[0,1,2,3]` if you must avoid specific cards. Its length must equal `num_gpus`. |
 | `cpu_workers` | `nproc`. Used only by the CPU trim stage; no GPU involved. |
+| `shard_assignment` | leave as `dynamic`. **Especially if your GPUs are not all the same model** — see §2.5. |
 | `shuffle_mem_bytes` | `free -b \| awk '/^Mem:/{print $2}'`, then take ~70%. Internally capped at 256 GiB regardless of what you put. |
 
 To see VRAM per GPU (you need ≥ 24 GiB per card):
@@ -83,6 +87,38 @@ To see VRAM per GPU (you need ≥ 24 GiB per card):
 ```bash
 nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv
 ```
+
+### 2.5 If your GPUs are not all the same model
+
+You are expected to be running a mix of **H200 (Hopper, sm_90)**, **B200 (Blackwell,
+sm_100)** and **B300 (Blackwell Ultra, sm_103)**. That is supported. Two things follow.
+
+**Throughput.** Leave `shard_assignment: dynamic`. Each worker then claims the next free
+shard whenever it is ready, so the Blackwells are not held back by the H200s. The
+alternative, `static`, splits shards evenly by index — which is what the original pipeline
+did, correctly, because its cluster was uniformly H100. On a mixed fleet an even split
+means wall-clock equals the slowest card. In testing, a worker 8× slower than its peers
+took 28 shards while they took 61 each; an even split would have forced 50/50/50.
+
+**Comparability — read this before you start.** The original data was generated on H100
+(sm_90) using FlashAttention v3, which is Hopper-only; on Blackwell, vLLM selects a
+different attention backend. Greedy decoding at `temperature=0` is **not** bitwise
+identical across GPU architectures: an argmax can flip on a near-tie, and the rest of that
+generation diverges from there. So:
+
+* **Run every one of the 12 jobs on the same GPU set.** Jobs are sequential and each uses
+  all GPUs, so every arm then sees the same hardware mixture and the effect is *balanced
+  across arms*. Changing `compute.gpu_ids` partway through the 12 jobs is the thing that
+  would actually bias the arm-vs-arm comparison — it would confound "which arm" with
+  "which GPU".
+* **Do not delete the `.done` sidecars.** Every one records `gpu_name` and `gpu_cc` for the
+  shard it marks. That is the only way to reconstruct which architecture produced which
+  rows after the fact.
+* If Wytro would rather have the cleanest possible result and can spare the hardware,
+  running all 12 jobs on a single architecture is better still. **That is Wytro's call, not
+  yours** — ask before deciding it either way.
+
+`preflight.py` detects a mixed fleet, prints the breakdown, and repeats this warning.
 
 ### 2.3 `configs/cluster.yaml` — `env`
 
@@ -187,6 +223,10 @@ Agent: **do not decide these yourself.** Stop, ask, and wait.
 | **`sidecar fingerprint does not match the manifest`** | The input was re-sharded after some output was generated, so `doc_id`s were renumbered. | Do not delete anything yet. This normally means `sharding.*` in `data.yaml` was changed, or `data_root` was rebuilt. Ask Wytro. The safe fix is to restore the original sharding; the expensive fix is regenerating that job. |
 | **`overhead is N, expected M`** | The prompt file, chat template, or tokenizer differs from the original pipeline. | **Do not edit `expected_overhead` to make it pass.** That integer is the proof the prompt is byte-correct. Check that no prompt file was modified (`git status`), and that the model revision resolved to the same chat template. Then ask. |
 | **Model download keeps restarting** | Interrupted transfers. | It is idempotent — re-run `python scripts/01_download_model.py`. Once complete it verifies locally and never touches the network again (`--offline` forces that). |
+| **`this torch build has NO kernels for sm_XXX`** | The pinned torch build cannot run one of your cards. | **Stop.** Do not install a different torch or vLLM — a different build changes generation behaviour and destroys comparability across the arms. Report the exact line to Wytro; re-pinning the whole stack so all 12 jobs share one build is the only correct fix. |
+| **`no exact sm_XXX kernels ... will PTX-JIT`** | Your card runs, but through JIT-compiled PTX rather than tuned kernels. | Not an error. Expect a slow first few minutes while it compiles, then normal speed. Watch the first job's `tok/s`; if it stays far below the other cards, tell Wytro. |
+| **One GPU finishes long before the others** | Heterogeneous fleet with `shard_assignment: static`. | Set `shard_assignment: dynamic` in `cluster.yaml` and re-run. Safe at any point — it only changes which worker takes which shard, never what is generated. Finished shards are skipped. |
+| **A shard is stuck; no worker picks it up** | A `part_NNNNN.claim` directory left by a run that was killed. | The launcher clears these automatically on every start, so just re-run `03_run_job.sh`. To do it by hand: `python -m rewrite.run_rewrite --arm A --prompt-id pN --reap-claims`. **Never run that while workers are live** — it would let two workers take the same shard. |
 | **Everything is slow** | Usually `tmp_root` on a network filesystem, or `cpu_workers` set too low for the trim stage. | Both are safe to change — they affect speed only, never output. |
 
 ---
@@ -213,11 +253,17 @@ A hard list. Each item exists because doing it silently invalidates the experime
 6. **Do not "fix" a version mismatch by installing a different vLLM/torch/transformers.**
    A different build produces different text at `temperature=0`, and afterwards there is
    no way to tell which rows came from which build. Stop and ask instead.
-7. **Do not parallelise jobs to save time.** Each job already uses every GPU. Two at once
+7. **Do not change `compute.gpu_ids` or `num_gpus` partway through the 12 jobs.** On a
+   mixed-architecture fleet that confounds "which arm" with "which GPU" and quietly biases
+   the comparison the whole experiment exists to make. Decide the GPU set once, before job
+   1, and keep it.
+8. **Do not delete `.done` sidecars to reclaim space.** They are tiny, they are the resume
+   markers, and they carry the record of which GPU generated which shard.
+9. **Do not parallelise jobs to save time.** Each job already uses every GPU. Two at once
    means two engines each trying to reserve 85% of the same card. The `flock` in
    `03_run_job.sh` prevents it — do not remove it.
-8. **Do not delete output to free space** without asking. A missing shard breaks row
+10. **Do not delete output to free space** without asking. A missing shard breaks row
    conservation, and at this scale regenerating one is hours of GPU time.
-9. **Do not commit `.env`, a token, model weights, or data.** `.gitignore` covers all of
+11. **Do not commit `.env`, a token, model weights, or data.** `.gitignore` covers all of
    them; keep it that way.
-10. **Do not lower `gpu_memory_utilization` to dodge an OOM.** See §5, row 1.
+12. **Do not lower `gpu_memory_utilization` to dodge an OOM.** See §5, row 1.

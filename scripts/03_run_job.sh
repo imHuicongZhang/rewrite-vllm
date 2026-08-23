@@ -100,6 +100,12 @@ if ! flock -n 9; then
   exit 3
 fi
 
+# Clear shard claims left behind by a run that died. Safe here and ONLY here: we hold the
+# job lock and no worker of this run has started, so any surviving claim is from a dead run.
+PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+python -u -m rewrite.run_rewrite --arm "$ARM" --prompt-id "$PROMPT_ID" \
+    --config-root "$REPO_ROOT" --reap-claims
+
 echo "=== $ARM/$PROMPT_ID :: $NGPU worker(s) on GPU(s) ${GPU_IDS[*]} ==="
 echo "    logs: $LOG_DIR/worker<i>.log"
 

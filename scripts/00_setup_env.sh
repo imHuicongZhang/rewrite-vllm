@@ -70,14 +70,18 @@ DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 |
 NGPU=$(nvidia-smi --list-gpus | wc -l | tr -d ' ')
 CCAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ' ')
 SMI_CUDA=$(nvidia-smi | sed -n 's/.*CUDA Version: *\([0-9][0-9.]*\).*/\1/p' | head -1)
-VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | tr -d ' ')
+# smallest card decides whether the model fits, not whichever happens to be GPU 0
+VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | tr -d ' ' | sort -n | head -1)
+ARCHS=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d ' ' | sort -u | tr '\n' ' ')
+NARCH=$(echo "$ARCHS" | wc -w)
 
 echo
 echo "   driver_version : $DRIVER"
 echo "   cuda (per smi) : ${SMI_CUDA:-unknown}"
 echo "   gpu count      : $NGPU"
 echo "   compute cap    : $CCAP   (sm_${CCAP//./})"
-echo "   vram per gpu   : ${VRAM_MIB} MiB"
+echo "   all archs      : $ARCHS"
+echo "   vram (smallest): ${VRAM_MIB} MiB"
 echo "   pinned target  : torch ${PIN_TORCH}+cu130, vllm ${PIN_VLLM}, CUDA ${REQ_CUDA_MAJOR}.x"
 
 # ---- hard stop on a driver that cannot run the pinned wheels ----
@@ -114,6 +118,29 @@ if [ "$VRAM_MIB" -lt 24000 ]; then
    Ask Wytro before changing anything."
 fi
 echo "   -> driver and VRAM are compatible with the pinned stack."
+
+if [ "$NARCH" -gt 1 ]; then
+  cat <<'MIXED'
+
+   NOTE: this node has MORE THAN ONE GPU ARCHITECTURE.
+   That is supported. Leave compute.shard_assignment as "dynamic" in configs/cluster.yaml
+   so the faster cards are not held back by the slower ones.
+   It does have a consequence for the science -- preflight.py explains it in full, and
+   every shard records which GPU produced it. Read that section before starting the run.
+MIXED
+fi
+
+case "$ARCHS" in *10.*|*11.*|*12.*)
+  cat <<'BLACKWELL'
+
+   NOTE: a Blackwell-class GPU (sm_100 / sm_103 / sm_120) is present.
+   The original data was generated on H100 (sm_90) with FlashAttention v3, which is
+   Hopper-only; vLLM will choose a different attention backend on these cards. Expected,
+   and recorded per shard. Step 5 below runs a real generation, which is what proves the
+   pinned build actually has working kernels for this architecture -- do not skip it.
+BLACKWELL
+  ;;
+esac
 
 # ===========================================================================
 say "2/5  Creating the environment: $ENV_NAME (python $PY_VERSION)"
@@ -197,6 +224,27 @@ for k, v in expect.items():
 if bad:
     sys.exit(2)
 print("   all imports OK, versions match the pins")
+
+# Does this torch build actually carry kernels for every card in this box?
+built = set(torch.cuda.get_arch_list())
+print(f"   torch built for: {sorted(built)}")
+bad = []
+for i in range(torch.cuda.device_count()):
+    p = torch.cuda.get_device_properties(i)
+    cc = f"sm_{p.major}{p.minor}"
+    if cc in built:
+        print(f"   OK   GPU {i} {p.name:28s} {cc}  native kernels")
+    elif any(a.startswith(f"sm_{p.major}") for a in built):
+        print(f"   WARN GPU {i} {p.name:28s} {cc}  no exact kernels; will PTX-JIT")
+    else:
+        print(f"   FAIL GPU {i} {p.name:28s} {cc}  NO kernels in this build")
+        bad.append((i, p.name, cc))
+if bad:
+    print("   *** This pinned torch build cannot run:", bad, file=sys.stderr)
+    print("   *** Do NOT install a different torch/vLLM to work around it -- a different"
+          "\n       build changes generation behaviour and destroys comparability across"
+          "\n       the arms. Stop and ask Wytro.", file=sys.stderr)
+    sys.exit(2)
 PYCHK
 
 # ===========================================================================
@@ -222,6 +270,8 @@ PYH
   fi
   MODEL_ARG="${REAL_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
   echo "   generating with: $MODEL_ARG"
+  echo "   (on a mixed fleet this proves ONE card works; preflight.py step 10 and the"
+  echo "    first real job exercise the rest)"
   [ -z "$REAL_MODEL" ] && echo "   (the real model is not downloaded yet, so a tiny stand-in is used;" \
                                "this only proves the vLLM install works)"
   python - "$MODEL_ARG" <<'PYGEN'

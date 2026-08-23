@@ -104,17 +104,82 @@ def c3_gpus(cfg, args) -> bool:
         return fail(f"torch sees {n} GPU(s) but cluster.yaml compute.num_gpus is "
                     f"{cfg.num_gpus}. Fix the config, or set CUDA_VISIBLE_DEVICES.")
     good = True
+    archs, models = {}, {}
+    try:
+        built = set(torch.cuda.get_arch_list())      # e.g. {'sm_90', 'sm_100', ...}
+    except Exception:
+        built = set()
+
     for i in range(n):
-        p = torch.cuda.get_device_properties(i)
-        gib = p.total_memory / 2**30
-        line = f"GPU {i}: {p.name}  {gib:.1f} GiB  sm_{p.major}{p.minor}"
+        pr = torch.cuda.get_device_properties(i)
+        gib = pr.total_memory / 2**30
+        cc = f"sm_{pr.major}{pr.minor}"
+        archs.setdefault(cc, []).append(i)
+        models.setdefault(pr.name, []).append(i)
+        line = f"GPU {i}: {pr.name}  {gib:.1f} GiB  {cc}"
         if gib < 23.5:
             good = fail(line + "  -- too small for Qwen2.5-7B bf16 at "
                                "gpu_memory_utilization=0.85 / max_model_len=32768")
+            continue
+
+        # Does this torch build actually have kernels for this card?
+        if not built:
+            warn(line + "  -- could not read torch.cuda.get_arch_list()")
+        elif cc in built:
+            ok(line + "  (native kernels present)")
         else:
-            ok(line)
-    kv = (0.85 * torch.cuda.get_device_properties(0).total_memory / 2**30) - 14.2
-    ok(f"estimated KV cache after ~14.2 GiB of bf16 weights: ~{kv:.1f} GiB/GPU")
+            same_major = [a for a in built
+                          if a.startswith(f"sm_{pr.major}") or a.startswith(f"sm_{pr.major}0")]
+            if same_major:
+                warn(line + f"  -- no exact {cc} kernels in this torch build "
+                            f"({sorted(built)}); it will PTX-JIT from {sorted(same_major)}. "
+                            "That works but is slower on first use, and the kernels are not "
+                            "the tuned ones. Watch the first job's tok/s.")
+            else:
+                good = fail(line + f"  -- this torch build has NO kernels for {cc} "
+                                   f"(it has {sorted(built)}). vLLM will not run here. "
+                                   "STOP and ask Wytro; do not swap in another torch build "
+                                   "on your own.")
+
+    kv = (0.85 * min(torch.cuda.get_device_properties(i).total_memory
+                     for i in range(n)) / 2**30) - 14.2
+    ok(f"estimated KV cache on the SMALLEST card after ~14.2 GiB of bf16 weights: "
+       f"~{kv:.1f} GiB")
+
+    # ---- heterogeneous fleet: allowed, but it has to be understood and recorded ----
+    if len(archs) > 1 or len(models) > 1:
+        print()
+        warn("MIXED GPU FLEET DETECTED:")
+        for name, idxs in sorted(models.items()):
+            cc = f"sm_{torch.cuda.get_device_properties(idxs[0]).major}" \
+                 f"{torch.cuda.get_device_properties(idxs[0]).minor}"
+            print(f"          {len(idxs)}x {name} ({cc}) -> GPUs {idxs}")
+        print("""
+     This is supported, and compute.shard_assignment: dynamic (the default) will keep the
+     fast cards busy instead of running at the slowest card's pace.
+
+     But understand what it means for the science. The original data was generated on
+     H100 (sm_90) using FlashAttention v3, which is Hopper-only; on Blackwell vLLM picks a
+     different attention backend. Greedy decoding at temperature=0 is NOT bitwise identical
+     across architectures -- an argmax can flip on a near-tie and the rest of a generation
+     diverges from there. So:
+
+       * Every shard's .done sidecar records gpu_name and gpu_cc. That is what makes the
+         mixture auditable afterwards; do not delete the sidecars.
+       * Run every job on the SAME GPU set. Jobs are sequential and each uses all GPUs, so
+         every arm then sees the same hardware mixture and the confound is BALANCED across
+         arms rather than segregated into one of them. Changing compute.gpu_ids partway
+         through the 12 jobs is the thing that would actually bias the comparison.
+       * If you want the cleanest result and can afford it, run all 12 jobs on one
+         architecture. That is Wytro's call, not yours.""")
+        print()
+    else:
+        ok(f"homogeneous fleet: {n}x {list(models)[0]}")
+
+    if any(int(a.split('_')[1]) >= 100 for a in archs if a.startswith('sm_')):
+        warn("Blackwell-class GPU present. The original run used FlashAttention v3 "
+             "(Hopper-only); vLLM will select a different backend here. Expected, and "
+             "recorded per shard -- but it is a real difference from the source run.")
     return good
 
 

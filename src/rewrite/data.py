@@ -208,6 +208,87 @@ def clean_stale_tmp(job_output_dir: Path, owned: list, suffix: str) -> int:
     return n
 
 
+# --------------------------------------------------------------------------- claims
+# Dynamic shard claiming, for heterogeneous GPU fleets.
+#
+# The source assigned shards statically: shard_index % num_workers == worker_id. That is
+# correct and perfectly balanced when every worker owns an identical GPU, which was true
+# on its homogeneous H100 cluster. It is NOT true on a mixed H200 / B200 / B300 fleet: a
+# Blackwell can be several times a Hopper on this workload, so equal shard counts leave the
+# fast cards idling while the slow ones finish. Wall clock is the slowest worker.
+#
+# Claiming instead lets each worker take the next unclaimed shard when it is free, so the
+# fleet self-balances whatever the mix. Which worker does which shard does not change what
+# is generated for a document -- generation is per-document and independent -- but WHICH
+# GPU generated it does affect the text slightly (see docs/HANDOFF_REVIEW.md), so every
+# sidecar records the GPU that produced it.
+#
+# A claim is an atomically created DIRECTORY. os.mkdir is atomic on every POSIX filesystem
+# including NFS, where O_CREAT|O_EXCL is not reliably so.
+
+def claim_path(job_output_dir: Path, si: int) -> Path:
+    return Path(job_output_dir) / f"part_{si:05d}.claim"
+
+
+def try_claim(job_output_dir: Path, si: int, owner: dict) -> bool:
+    """Atomically claim shard `si`. True if this worker got it."""
+    cp = claim_path(job_output_dir, si)
+    try:
+        cp.mkdir()                      # atomic: exactly one worker wins
+    except FileExistsError:
+        return False
+    try:
+        atomic_write_text(json.dumps(owner, indent=2), cp / "owner.json")
+    except OSError:
+        pass
+    return True
+
+
+def release_claim(job_output_dir: Path, si: int) -> None:
+    """Drop a claim we could not complete, so another worker can pick the shard up."""
+    cp = claim_path(job_output_dir, si)
+    try:
+        (cp / "owner.json").unlink()
+    except OSError:
+        pass
+    try:
+        cp.rmdir()
+    except OSError:
+        pass
+
+
+def reap_stale_claims(job_output_dir: Path, log=print) -> int:
+    """Remove claims left behind by a previous, now-dead run.
+
+    Called ONCE by the launcher before any worker starts, which is what makes it safe: at
+    that moment no worker of this run is alive, so every claim without a matching .done
+    belongs to a run that died. Workers never call this -- doing so would let one worker
+    steal a live claim from another.
+    """
+    d = Path(job_output_dir)
+    if not d.exists():
+        return 0
+    n = 0
+    for cp in sorted(d.glob("part_*.claim")):
+        si = int(cp.name.split("_")[1].split(".")[0])
+        done = [p for p in d.glob(f"part_{si:05d}.done")]
+        if done:
+            # completed; the claim is just litter
+            pass
+        try:
+            (cp / "owner.json").unlink()
+        except OSError:
+            pass
+        try:
+            cp.rmdir()
+            n += 1
+        except OSError:
+            pass
+    if n:
+        log(f"[claims] reaped {n} stale claim(s) from a previous run in {d}")
+    return n
+
+
 # --------------------------------------------------------------------------- download
 def _hf_kwargs(cfg: Config, write: bool = False):
     tok = cfg.env.get("HF_TOKEN_WRITE" if write else "HF_TOKEN") or None

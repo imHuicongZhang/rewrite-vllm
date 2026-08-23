@@ -68,6 +68,51 @@ carry, and a 2.4 GB FastText model. See open question 3.
 
 Ordered by how much they matter.
 
+0. **Target hardware is a mixed H200 / B200 / B300 fleet — read this first.**
+   You told me this after the first build, and it is the single biggest threat to the
+   experiment, so it goes above the rest.
+
+   The original data was generated on **H100 (sm_90)** using **FlashAttention v3**, which
+   is Hopper-only — I confirmed both from the source's own runtime logs (`Using
+   FlashAttention version 3`, `NVIDIA H100 NVL`). On Blackwell (B200 = sm_100, B300 =
+   sm_103) vLLM will select a **different attention backend**. This is not merely a
+   different reduction order: it is a different kernel.
+
+   Greedy decoding at `temperature=0` is **not** bitwise identical across architectures.
+   An argmax can flip on a near-tie, and because generation is autoregressive, one flipped
+   token diverges the remainder of a up-to-4096-token output. It is the same class of
+   hazard the version pinning exists to prevent, except silent.
+
+   **Why this is survivable, and what makes it survivable.** Jobs run sequentially and
+   each uses every GPU, so if the GPU set is held constant across all 12 jobs, every arm
+   sees the *same* hardware mixture. The architecture effect is then **balanced across
+   arms** rather than segregated into one, which keeps the arm-vs-arm comparison honest.
+   The failure mode to avoid is changing `gpu_ids` partway through — that would confound
+   "which arm" with "which GPU". The guide says this in §2.5 and again in the do-not list.
+
+   **What I added so this is auditable rather than invisible:** every shard's `.done`
+   sidecar now records `gpu_name` and `gpu_cc`. After the run you can reconstruct exactly
+   which architecture produced which rows, per shard, for all 12 jobs. Without it that
+   information is gone forever.
+
+   **What preflight now catches**, before a GPU-hour is spent: it compares each device's
+   compute capability against `torch.cuda.get_arch_list()` and reports native kernels /
+   PTX-JIT fallback / **no kernels at all** (hard fail); prints the fleet breakdown when it
+   is heterogeneous; and repeats the comparability warning. `00_setup_env.sh` runs the same
+   arch check right after installing, and its VRAM check now uses the **smallest** card
+   rather than GPU 0.
+
+   **My recommendation:** if you can spare it, run all 12 jobs on one architecture — most
+   likely the B200/B300 pool, since it is faster and the H200s can do something else.
+   Second best is the balanced mixture above. The worst outcome is an unplanned mixture
+   that nobody recorded, and that one is now impossible.
+
+   **Not verified here:** whether `torch 2.11.0+cu130` / `vllm 0.22.0` / `flashinfer
+   0.6.11.post2` actually carry working sm_100 and sm_103 kernels. CUDA 13 supports both,
+   and sm_103 should at worst PTX-JIT from sm_100, but I have no Blackwell card to test on.
+   The preflight arch check and `00_setup_env.sh`'s real one-prompt generation are what
+   will answer it, in minutes, on his machine.
+
 1. **`wrap-inspired` semantics — the big one.** The source assigned **one of four styles
    per document** via `np.random.default_rng([42, shard_index])`: a single pass producing
    one output per document. This package does **four complete passes**, producing four
@@ -98,6 +143,18 @@ Ordered by how much they matter.
    the source's. Irrelevant to greedy per-document generation; it does change shuffle
    output ordering. A manifest `fingerprint` refuses to re-shard under a finished run,
    because that would renumber `doc_id` and silently invalidate every `.done` marker.
+
+4b. **Shard assignment is dynamic by default, not static modulo.** The source used
+   `shard_index % num_workers == worker_id` — correct and perfectly balanced on its
+   homogeneous H100 cluster, and wrong for a mixed fleet, where equal shard counts mean
+   wall-clock equals the slowest card. Workers now claim the next free shard via an
+   atomically created directory (`os.mkdir`, which is atomic even on NFS, unlike
+   `O_CREAT|O_EXCL`). Same shards processed, same output; only *which worker* does *which
+   shard* changes. `shard_assignment: static` restores exact source behaviour. Stale claims
+   from a killed run are reaped once by the launcher, under the job lock, before any worker
+   starts — never by a worker, which would let two workers take the same shard. Measured in
+   the integration test: a worker 8× slower than its peers took 28 shards to their 61,
+   where static would have forced 50/50/50.
 
 5. **`.done` sidecars added.** The source used the output parquet's own existence as the
    completion marker. Parquet is self-describing (its footer carries `num_rows`); JSONL is
@@ -298,7 +355,12 @@ Recorded rather than silently resolved.
 5. **Shuffled output format.** Your spec fixes JSONL for the rewrite stage and is silent
    after the shuffle; I default to parquet (source parity, and better on the Hub).
 
-6. **A length-distribution check before the full run?** The source dropped 0.04–0.12% of
+6. **One architecture, or the balanced mixture?** See divergence 0. My recommendation is
+   all 12 jobs on one architecture if you can spare the hardware; the balanced mixture is a
+   sound second. Either way the GPU set must be fixed before job 1. Tianjian should not be
+   the one deciding this.
+
+7. **A length-distribution check before the full run?** The source dropped 0.04–0.12% of
    documents as over-length. If the Hub-hosted corpora have a different length profile, the
    status-0 rate will differ. A 10,000-document histogram of templated `n_in` per arm is
    cheap and would catch a corpus mismatch before 12 jobs run. Not built — say the word.
@@ -312,10 +374,13 @@ Recorded rather than silently resolved.
 * trim differential test — 72,443 comparisons vs. the source functions, 0 mismatches
 * shuffle parity — body comparison + execution test, identical ordering on 63,000 rows
 * prompt overhead parity — all 6 prompts against the source's logged values
-* full end-to-end integration with a stubbed engine — **90 checks, 0 failures**, covering
+* full end-to-end integration with a stubbed engine — **100 checks, 0 failures**, covering
   config validation, sharding, all 12 jobs across 3 workers, row conservation, `.done`
   resume, stale-`.tmp` cleanup, the fingerprint interlock, deliberate corruption detection,
-  deep verify, trim, and shuffle
+  deep verify, trim, and shuffle — plus, on a simulated heterogeneous fleet, concurrent
+  shard claiming under contention, load rebalancing toward the fast workers, a live claim
+  correctly blocking a second worker, stale-claim reaping, GPU provenance in every sidecar,
+  and `shard_assignment: static` still working
 * `py_compile` on all Python, `bash -n` on all shell
 * `check_placeholders.py` on both a blank and a fully-filled repo
 
@@ -327,6 +392,9 @@ Recorded rather than silently resolved.
   Qwen tokenizer, smoke test). Steps 1, 2, 7, 8, 9 are exercisable without a GPU; the
   prompt-parity logic is the same code the standalone parity test ran and passed.
 * Any real vLLM call, and any Hub download or upload.
+* **Anything on Blackwell.** No H200, B200 or B300 was available here — this login node has
+  no GPU at all. The sm_100/sm_103 kernel-availability question is answered by preflight
+  and by `00_setup_env.sh`'s generation check on his machine, in minutes.
 
 **Two real bugs the integration test caught**, both fixed and regression-tested:
 

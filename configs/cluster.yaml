@@ -48,6 +48,17 @@ compute:
   # how to find:  nproc
   cpu_workers: "<<<TIANJIAN: CPU processes for postprocess as a plain integer, e.g. 32>>>"
 
+  # How shards are handed to workers.
+  #   dynamic (default) -- each worker claims the next free shard when it is ready, so a
+  #                        MIXED fleet (e.g. H200 + B200 + B300) self-balances instead of
+  #                        running at the slowest card's pace. Use this if your GPUs are
+  #                        not all the same model.
+  #   static            -- shard_index % num_gpus == worker_id, exactly as the original
+  #                        pipeline did it. Only balanced when every GPU is identical.
+  # Either way the same shards get processed and the output is the same; this only decides
+  # WHICH worker does which shard.
+  shard_assignment: dynamic
+
   # Usable RAM in BYTES for the shuffle. Internally capped at 256 GiB regardless.
   # how to find:  free -b | awk '/^Mem:/{print $2}'   then take ~70% of that
   shuffle_mem_bytes: "<<<TIANJIAN: usable RAM in bytes, e.g. 274877906944 for 256GiB>>>"
