@@ -1,0 +1,87 @@
+# configs/cluster.yaml -- YOUR MACHINE. Tianjian, this file is yours; nothing else in the
+# repo needs editing.
+#
+# Every value below is a blank for you to fill. Replace the whole placeholder
+# INCLUDING the surrounding quotes, e.g.   repo_root: /home/tj/rewrite-vllm
+# Run `python scripts/check_placeholders.py` to see what is left; `scripts/run_all.sh`
+# refuses to start while any blank remains.
+#
+# docs/GUIDE_FOR_TIANJIAN.md section 2 tells you how to find each value on your machine.
+# ${...} references to other keys in this file are expanded automatically.
+
+paths:
+  # Absolute path to this cloned repository.      how to find:  pwd
+  repo_root: "<<<TIANJIAN: absolute path to this cloned repo, e.g. /home/tj/rewrite-vllm>>>"
+
+  # Qwen2.5-7B-Instruct weights + Llama-2 tokenizer. Needs ~20 GB free.
+  model_dir: "<<<TIANJIAN: dir for model downloads, needs ~20GB free>>>"
+
+  # Downloaded and re-sharded input datasets. Needs roughly 2x the raw dataset size;
+  # preflight.py prints the real number for your repo IDs.
+  data_root: "<<<TIANJIAN: dir for downloaded + resharded input data, needs several TB>>>"
+
+  # Rewritten output. This is the big one: ~2.4 TB uncompressed, ~0.7 TB with zstd.
+  out_root: "<<<TIANJIAN: dir for rewritten output, see the preflight disk estimate>>>"
+
+  # Fast LOCAL scratch for shuffle bucket files (written then deleted). A network
+  # filesystem here will make the shuffle slow.
+  # sizing: ~1.2x the largest single (arm, prompt) output.
+  tmp_root: "<<<TIANJIAN: fast local scratch dir for shuffle temporaries>>>"
+
+  # Per-worker logs. Small.
+  log_root: "<<<TIANJIAN: dir for logs, e.g. ${repo_root}/logs>>>"
+
+  # HuggingFace cache (HF_HOME).
+  # Do NOT put this in a quota-limited home directory -- downloads will fill it.
+  hf_cache: "<<<TIANJIAN: HF_HOME cache dir, e.g. ${data_root}/hf_cache>>>"
+
+compute:
+  # GPUs to use. One vLLM process per GPU, each tensor_parallel_size=1.
+  # how to find:  nvidia-smi --list-gpus | wc -l
+  num_gpus: "<<<TIANJIAN: number of GPUs as a plain integer, e.g. 8>>>"
+
+  # "auto" = 0..num_gpus-1. Use an explicit list like [0,1,2,3] if other users share the
+  # node and you must avoid some GPUs -- see GUIDE section 4.
+  gpu_ids: auto
+
+  # CPU processes for the postprocess/trim stage. No GPU involved.
+  # how to find:  nproc
+  cpu_workers: "<<<TIANJIAN: CPU processes for postprocess as a plain integer, e.g. 32>>>"
+
+  # Usable RAM in BYTES for the shuffle. Internally capped at 256 GiB regardless.
+  # how to find:  free -b | awk '/^Mem:/{print $2}'   then take ~70% of that
+  shuffle_mem_bytes: "<<<TIANJIAN: usable RAM in bytes, e.g. 274877906944 for 256GiB>>>"
+
+env:
+  # Exact shell line that activates the environment scripts/00_setup_env.sh creates.
+  # That script prints the line to paste here when it finishes.
+  activate_cmd: "<<<TIANJIAN: env activation line, e.g. source /opt/conda/bin/activate rewrite>>>"
+
+  # Anything else that must run before python (environment modules, proxy vars).
+  # "" if none.
+  extra_preamble: ""
+
+scheduler:
+  # 'bash' is the default and the supported path: plain bash, one node, N GPUs.
+  # Set 'slurm' ONLY if you have a scheduler and have read
+  # scripts/optional/slurm_job.sbatch. That path is optional and unsupported.
+  kind: bash
+  slurm:
+    partition: ""     # only used when kind: slurm
+    account: ""       # only used when kind: slurm
+    gres: ""          # only used when kind: slurm, e.g. gpu:8
+    time_limit: ""    # only used when kind: slurm, e.g. 3-00:00:00
+
+runtime:
+  # Run fully offline once the model and data are downloaded.
+  # Source parity: HF_HUB_OFFLINE=1 / TRANSFORMERS_OFFLINE=1 on every compute node.
+  hf_hub_offline_after_download: true
+
+  # Source parity (rewrite_worker.py:32). Leave false.
+  tokenizers_parallelism: false
+
+  # zstd | none.  'none' needs roughly 3.5x the disk.
+  output_compression: zstd
+
+  # Write a progress line every N completed shards.
+  progress_log_every_shards: 1

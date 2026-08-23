@@ -1,0 +1,531 @@
+"""HuggingFace download, re-sharding, manifests, shard IO, and job verification.
+
+Deliberately free of torch/vllm imports so it works on a CPU-only shell.
+
+Why we re-shard at all: the source consumed a pre-existing 200-shard parquet layout on
+JHU scratch. Here the inputs arrive from the Hub in whatever layout their authors chose,
+so we impose our own. The shard is simultaneously
+  * the unit of work,
+  * the unit of resume, and
+  * the unit of the output-rows == input-rows proof,
+which is why sharding happens ONCE PER ARM and is reused by all of that arm's prompts.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from .config import Config, JobSpec, stop
+
+SHARD_RE = re.compile(r"part_(\d+)\.parquet$")
+MANIFEST_NAME = "manifest.json"
+DOC_ID_POLICY = "v1:sorted-files,row-order,0-based-int64"
+
+
+# --------------------------------------------------------------------------- atomic IO
+def atomic_write_bytes(data: bytes, dest: Path) -> None:
+    """Write bytes atomically: .tmp in the SAME dir, then os.replace.
+
+    On any exception the partial .tmp is removed so it can never be mistaken for output.
+    source: 10_postprocess/pp_io.py:34-47
+    """
+    dest = Path(dest)
+    tmp = dest.with_name(dest.name + ".tmp")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_text(text: str, dest: Path) -> None:
+    atomic_write_bytes(text.encode("utf-8"), dest)
+
+
+def atomic_write_table(table, dest: Path, compression: str = "zstd") -> None:
+    """source: 10_postprocess/pp_io.py:34-47, ported verbatim."""
+    dest = str(dest)
+    tmp = dest + ".tmp"
+    try:
+        pq.write_table(table, tmp, compression=compression)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def sha1_text(s) -> str:
+    """SHA-1 of the source document, UTF-8. `None` is treated as '' -- matching the
+    source's `doc_text = doc_text or ""` (rewrite_worker.py:47)."""
+    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------------- manifest
+@dataclass
+class Manifest:
+    arm: str
+    repo_id: str
+    revision: str
+    rewrite: bool
+    fingerprint: str
+    total_rows: int
+    total_text_bytes: int
+    content_sha1: str
+    n_shards: int
+    shards: list
+    doc_id_policy: str = DOC_ID_POLICY
+    total_tokens_llama2: int | None = None
+
+    def to_json(self) -> str:
+        return json.dumps(self.__dict__, indent=2)
+
+    @staticmethod
+    def from_json(s: str) -> "Manifest":
+        return Manifest(**json.loads(s))
+
+    def shard_rows(self, index: int) -> int:
+        for s in self.shards:
+            if s["index"] == index:
+                return s["n_rows"]
+        stop(f"{self.arm}: manifest has no shard {index}")
+
+
+def manifest_path(cfg: Config, arm: str) -> Path:
+    return cfg.shards_dir(arm) / MANIFEST_NAME
+
+
+def load_manifest(cfg: Config, arm: str) -> Manifest:
+    p = manifest_path(cfg, arm)
+    if not p.exists():
+        stop(f"{arm}: no manifest at {p}. Run scripts/02_download_data.py first.")
+    return Manifest.from_json(p.read_text())
+
+
+def input_rows(cfg: Config, arm: str) -> int:
+    """O(1) -- the number every (arm, prompt) output must match."""
+    return load_manifest(cfg, arm).total_rows
+
+
+def compute_fingerprint(cfg: Config, content_sha1: str) -> str:
+    """Interlock against re-sharding under a finished run.
+
+    Re-sharding renumbers doc_id and silently invalidates every .done marker downstream,
+    so the fingerprint folds in the sharding parameters as well as the content.
+    """
+    sh = cfg.data["sharding"]
+    blob = "|".join([content_sha1, str(sh["shard_target_rows"]),
+                     str(sh["shard_target_bytes"]), DOC_ID_POLICY])
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------------- shards
+def shard_paths(cfg: Config, arm: str) -> list:
+    out = []
+    for p in sorted(cfg.shards_dir(arm).glob("part_*.parquet")):
+        m = SHARD_RE.search(p.name)
+        if m:
+            out.append((int(m.group(1)), p))
+    return out
+
+
+def owned_shards(shards: list, worker_id: int, num_workers: int) -> list:
+    """Modulo assignment, exactly as the source's SLURM array did it.
+    source: 07_rewrite/rewrite_worker.py:197-203
+    """
+    return [(si, p) for si, p in shards if si % num_workers == worker_id]
+
+
+def read_shard(path: Path):
+    return pq.read_table(str(path), use_threads=False)
+
+
+# --------------------------------------------------------------------------- sidecars
+def sidecar_path(out_path: Path) -> Path:
+    """`part_00012.jsonl.zst` -> `part_00012.done` (suffixes stripped, not replaced)."""
+    name = Path(out_path).name
+    for suf in (".jsonl.zst", ".jsonl", ".parquet"):
+        if name.endswith(suf):
+            name = name[: -len(suf)]
+            break
+    return Path(out_path).with_name(name + ".done")
+
+
+def write_sidecar(out_path: Path, payload: dict) -> None:
+    """MUST be called AFTER the data file's os.replace.
+
+    Ordering is the whole safety argument: a crash between the two leaves a complete data
+    file with no marker, which is treated as NOT done and is regenerated. Wasteful by at
+    most one shard per worker, never wrong. The reverse ordering would be unsafe.
+    """
+    atomic_write_text(json.dumps(payload, indent=2), sidecar_path(out_path))
+
+
+def read_sidecar(p: Path):
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:
+        return None
+
+
+def done_shards(job_output_dir: Path) -> dict:
+    out = {}
+    for p in sorted(Path(job_output_dir).glob("part_*.done")):
+        d = read_sidecar(p)
+        if d is not None and "shard_index" in d:
+            out[int(d["shard_index"])] = d
+    return out
+
+
+def clean_stale_tmp(job_output_dir: Path, owned: list, suffix: str) -> int:
+    """Remove this worker's own leftover .tmp files before starting."""
+    n = 0
+    d = Path(job_output_dir)
+    for si, _ in owned:
+        for cand in (d / f"part_{si:05d}{suffix}.tmp", d / f"part_{si:05d}.done.tmp"):
+            if cand.exists():
+                try:
+                    cand.unlink()
+                    n += 1
+                except OSError:
+                    pass
+    return n
+
+
+# --------------------------------------------------------------------------- download
+def _hf_kwargs(cfg: Config, write: bool = False):
+    tok = cfg.env.get("HF_TOKEN_WRITE" if write else "HF_TOKEN") or None
+    return {"token": tok} if tok else {}
+
+
+def download_arm(cfg: Config, arm_name: str, log=print) -> None:
+    """Snapshot the dataset repo into the HF cache. Idempotent and resumable."""
+    from huggingface_hub import snapshot_download
+    a = cfg.arm(arm_name)
+    log(f"[data] {a.name}: snapshot_download({a.repo_id}, revision={a.revision})")
+    snapshot_download(repo_id=a.repo_id, repo_type="dataset", revision=a.revision,
+                      cache_dir=str(cfg.paths["hf_cache"]), **_hf_kwargs(cfg))
+    log(f"[data] {a.name}: download complete")
+
+
+def _open_dataset(cfg: Config, a, streaming: bool = False):
+    from datasets import load_dataset
+    return load_dataset(a.repo_id, revision=a.revision, split="train",
+                        streaming=streaming, cache_dir=str(cfg.paths["hf_cache"]),
+                        **_hf_kwargs(cfg))
+
+
+def probe_arm(cfg: Config, arm_name: str, log=print) -> dict:
+    """Assert the `text` column exists and is a non-empty string. Cheap: streams 1 row."""
+    a = cfg.arm(arm_name)
+    col = cfg.text_column
+    ds = _open_dataset(cfg, a, streaming=True)
+    row = next(iter(ds), None)
+    if row is None:
+        stop(f"{a.name}: dataset {a.repo_id} appears to be empty")
+    if col not in row:
+        stop(f"{a.name}: dataset {a.repo_id} has no {col!r} column; "
+             f"columns are {sorted(row)}")
+    if not isinstance(row[col], str):
+        stop(f"{a.name}: column {col!r} is {type(row[col]).__name__}, expected str")
+    if not row[col].strip():
+        stop(f"{a.name}: first row's {col!r} is empty")
+    log(f"[data] {a.name}: '{col}' column OK (columns: {sorted(row)})")
+    return {"columns": sorted(row)}
+
+
+# --------------------------------------------------------------------------- sharding
+def shard_arm(cfg: Config, arm_name: str, log=print, count_tokens: bool = False) -> Manifest:
+    """Re-shard one arm into fixed-size part_%05d.parquet chunks and write its manifest.
+
+    A shard closes when EITHER shard_target_rows or shard_target_bytes is reached, so one
+    pathological run of very long documents cannot become a multi-hour work unit.
+
+    Control arms (rewrite: false) are verified and counted but never sharded.
+    """
+    a = cfg.arm(arm_name)
+    sh = cfg.data["sharding"]
+    col = cfg.text_column
+    target_rows = int(sh["shard_target_rows"])
+    target_bytes = int(sh["shard_target_bytes"])
+    out_dir = cfg.shards_dir(a.name)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    existing = manifest_path(cfg, a.name)
+    if existing.exists():
+        man = Manifest.from_json(existing.read_text())
+        log(f"[data] {a.name}: manifest exists ({man.total_rows:,} rows, "
+            f"{man.n_shards} shards) -> skip")
+        return man
+
+    ds = _open_dataset(cfg, a, streaming=False)
+    if col not in ds.column_names:
+        stop(f"{a.name}: no {col!r} column; columns are {ds.column_names}")
+
+    has_doc_id = "doc_id" in ds.column_names
+    ltok = None
+    if count_tokens:
+        from .engine import load_llama2_tokenizer
+        ltok = load_llama2_tokenizer(cfg)
+
+    running = hashlib.sha1()
+    total_rows = total_bytes = total_tok = 0
+    shards = []
+    shard_idx = 0
+    buf_ids, buf_txt, buf_sha = [], [], []
+    buf_bytes = 0
+
+    def flush():
+        nonlocal shard_idx, buf_ids, buf_txt, buf_sha, buf_bytes
+        if not buf_txt:
+            return
+        if a.rewrite:
+            tbl = pa.table({
+                "doc_id": pa.array(buf_ids, type=pa.int64()),
+                col: pa.array(buf_txt, type=pa.large_string()),
+                "source_text_sha1": pa.array(buf_sha, type=pa.string()),
+            })
+            atomic_write_table(tbl, out_dir / f"part_{shard_idx:05d}.parquet")
+        shards.append({"index": shard_idx, "path": f"part_{shard_idx:05d}.parquet",
+                       "n_rows": len(buf_txt), "text_bytes": buf_bytes})
+        shard_idx += 1
+        buf_ids, buf_txt, buf_sha, buf_bytes = [], [], [], 0
+
+    log(f"[data] {a.name}: sharding "
+        f"(target {target_rows:,} rows / {target_bytes/2**20:.0f} MiB per shard)"
+        + ("" if a.rewrite else "  [CONTROL ARM: verify + count only, no shards written]"))
+
+    for batch in ds.select_columns(
+            [c for c in (col, "doc_id") if c in ds.column_names]).iter(batch_size=1000):
+        texts = batch[col]
+        ids = batch["doc_id"] if has_doc_id else None
+        if count_tokens:
+            total_tok += sum(len(x) for x in ltok(
+                [t or "" for t in texts], add_special_tokens=False).input_ids)
+        for k, t in enumerate(texts):
+            t = t or ""
+            h = sha1_text(t)
+            running.update(h.encode("ascii"))
+            nb = len(t.encode("utf-8"))
+            buf_ids.append(int(ids[k]) if ids is not None else total_rows)
+            buf_txt.append(t)
+            buf_sha.append(h)
+            buf_bytes += nb
+            total_rows += 1
+            total_bytes += nb
+            if len(buf_txt) >= target_rows or buf_bytes >= target_bytes:
+                flush()
+        if total_rows % 1_000_000 < 1000:
+            log(f"[data] {a.name}: {total_rows:,} rows, {shard_idx} shards")
+    flush()
+
+    content_sha1 = running.hexdigest()
+    man = Manifest(
+        arm=a.name, repo_id=a.repo_id, revision=a.revision, rewrite=a.rewrite,
+        fingerprint=compute_fingerprint(cfg, content_sha1),
+        total_rows=total_rows, total_text_bytes=total_bytes, content_sha1=content_sha1,
+        n_shards=len(shards), shards=shards,
+        total_tokens_llama2=(total_tok if count_tokens else None),
+    )
+
+    if a.rewrite:
+        min_ratio = int(sh["min_shards_per_gpu"])
+        need = min_ratio * cfg.num_gpus
+        if man.n_shards < need:
+            stop(
+                f"{a.name}: only {man.n_shards} shards for {cfg.num_gpus} GPUs "
+                f"({man.n_shards / cfg.num_gpus:.1f}:1). Shards are assigned "
+                f"round-robin (shard_index % num_gpus), which only balances when shards "
+                f"greatly outnumber workers -- the source ran 200 shards over 8 workers "
+                f"(25:1).\n  Lower configs/data.yaml sharding.shard_target_rows so there "
+                f"are at least {need} shards, delete {out_dir}, and re-run."
+            )
+
+    atomic_write_text(man.to_json(), manifest_path(cfg, a.name))
+    log(f"[data] {a.name}: {total_rows:,} rows, {len(shards)} shards, "
+        f"{total_bytes/2**30:.1f} GiB text, content_sha1={content_sha1[:12]}")
+    return man
+
+
+def write_data_manifest(cfg: Config, log=print) -> Path:
+    """Roll every arm's manifest into manifests/data_manifest.json."""
+    out = {"arms": {}}
+    for a in cfg.arms:
+        man = load_manifest(cfg, a.name)
+        out["arms"][a.name] = {
+            "repo_id": man.repo_id, "revision": man.revision, "rewrite": man.rewrite,
+            "total_rows": man.total_rows, "total_text_bytes": man.total_text_bytes,
+            "content_sha1": man.content_sha1, "fingerprint": man.fingerprint,
+            "n_shards": man.n_shards,
+            "total_tokens_llama2": man.total_tokens_llama2,
+            "n_prompts": len(a.prompts),
+            "n_rewrite_jobs": len(a.prompts) if a.rewrite else 0,
+        }
+    out["total_rewrite_jobs"] = sum(v["n_rewrite_jobs"] for v in out["arms"].values())
+    p = cfg.repo_root / "manifests" / "data_manifest.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(json.dumps(out, indent=2), p)
+    log(f"[data] wrote {p}")
+    return p
+
+
+# --------------------------------------------------------------------------- verify
+@dataclass
+class JobStatus:
+    job_id: str
+    n_shards: int
+    done: int
+    rows_out: int
+    out_tokens: int
+    state: str        # PENDING | PARTIAL | DONE
+    problems: list
+
+
+def verify_job(cfg: Config, job: JobSpec, deep: bool = False) -> JobStatus:
+    """The output-rows == input-rows guarantee, audited cheaply.
+
+    The guarantee itself is *created* per shard inside run_rewrite (status-0 documents
+    are emitted, not dropped, so a shard always yields exactly its input row count).
+    This function is the audit, and it costs only n_shards small JSON reads.
+
+    Checks:
+      1. shard-set coverage is exactly the manifest's shard set -- this is what catches a
+         prompt that only covered part of the corpus
+      2. per shard, n_rows_in == manifest rows == n_rows_out
+      3. every sidecar's input_fingerprint matches the manifest (catches resume against
+         a re-sharded input, which would have renumbered doc_id)
+      4. sum(n_rows_out) == manifest.total_rows      <- the required assertion
+      5. deep (opt-in): actually count the lines in every shard
+    """
+    man = load_manifest(cfg, job.arm)
+    got = done_shards(job.output_dir)
+    problems = []
+
+    expect = {s["index"] for s in man.shards}
+    missing = expect - set(got)
+    extra = set(got) - expect
+    if extra:
+        problems.append(f"{len(extra)} output shard(s) with no matching input shard: "
+                        f"{sorted(extra)[:5]}")
+
+    rows_out = out_tok = 0
+    for si, d in sorted(got.items()):
+        rows_out += int(d.get("n_rows_out", 0))
+        out_tok += int(d.get("n_output_tokens", 0))
+        if d.get("input_fingerprint") != man.fingerprint:
+            problems.append(f"shard {si}: sidecar fingerprint does not match the "
+                            f"manifest -- the input was re-sharded after this shard ran")
+        exp_rows = man.shard_rows(si)
+        if int(d.get("n_rows_in", -1)) != exp_rows:
+            problems.append(f"shard {si}: n_rows_in={d.get('n_rows_in')} != "
+                            f"manifest {exp_rows}")
+        if int(d.get("n_rows_out", -1)) != exp_rows:
+            problems.append(f"shard {si}: n_rows_out={d.get('n_rows_out')} != "
+                            f"input rows {exp_rows}  <-- ROW CONSERVATION VIOLATED")
+
+    if deep:
+        for si, d in sorted(got.items()):
+            p = job.output_dir / f"part_{si:05d}{cfg.shard_suffix}"
+            n = count_jsonl_rows(p)
+            if n != int(d.get("n_rows_out", -1)):
+                problems.append(f"shard {si}: file has {n} lines, sidecar claims "
+                                f"{d.get('n_rows_out')}")
+
+    if not missing and not problems and rows_out != man.total_rows:
+        problems.append(
+            f"TOTAL row count {rows_out:,} != input row count {man.total_rows:,} for arm "
+            f"{job.arm}. Every prompt must rewrite the ENTIRE dataset for its arm."
+        )
+
+    state = "DONE" if (not missing and not problems) else (
+        "PENDING" if not got else "PARTIAL")
+    return JobStatus(job_id=job.job_id, n_shards=man.n_shards, done=len(got),
+                     rows_out=rows_out, out_tokens=out_tok, state=state,
+                     problems=problems)
+
+
+def count_jsonl_rows(path: Path) -> int:
+    p = Path(path)
+    if not p.exists():
+        return 0
+    n = 0
+    for _ in iter_jsonl(p):
+        n += 1
+    return n
+
+
+# --------------------------------------------------------------------------- jsonl io
+def open_jsonl_write(path: Path, compress: bool | None = None):
+    """Return (file object, closer). zstd when the FINAL name says so, else plain.
+
+    `compress=None` infers from the filename, stripping a trailing ".tmp" first --
+    every caller writes to "<final>.tmp" and then os.replace()s it into place, so
+    inferring from the literal name would silently write PLAIN text into a file that
+    ends up named ".jsonl.zst" and is unreadable afterwards. Pass `compress` explicitly
+    to be certain.
+    """
+    path = Path(path)
+    name = path.name[:-4] if path.name.endswith(".tmp") else path.name
+    if compress is None:
+        compress = name.endswith(".zst")
+    if compress:
+        import zstandard as zstd
+        raw = open(path, "wb")
+        cctx = zstd.ZstdCompressor(level=3)
+        w = cctx.stream_writer(raw)
+        return w, (lambda: (w.close(), raw.close()))
+    raw = open(path, "wb")
+    return raw, (lambda: raw.close())
+
+
+def iter_jsonl(path: Path):
+    """Stream a shard's rows as dicts, transparently handling zstd."""
+    path = Path(path)
+    name = path.name[:-4] if path.name.endswith(".tmp") else path.name
+    if name.endswith(".zst"):
+        import zstandard as zstd
+        with open(path, "rb") as raw:
+            with zstd.ZstdDecompressor().stream_reader(raw) as r:
+                import io
+                for line in io.TextIOWrapper(r, encoding="utf-8"):
+                    line = line.strip()
+                    if line:
+                        yield json.loads(line)
+    else:
+        with open(path, "rt", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+
+
+def jsonl_to_table(path: Path, keys: list):
+    """Read a JSONL shard into a pa.Table -- the `load_fn` seam for the shuffle."""
+    cols = {k: [] for k in keys}
+    for row in iter_jsonl(path):
+        for k in keys:
+            cols[k].append(row.get(k))
+    types = {
+        "doc_id": pa.int64(), "arm": pa.large_string(), "prompt_id": pa.large_string(),
+        "source_text_sha1": pa.string(), "rewritten_text": pa.large_string(),
+        "finish_reason": pa.large_string(), "n_prompt_tokens": pa.int32(),
+        "n_output_tokens": pa.int32(), "status": pa.int8(),
+        "n_output_tokens_llama2": pa.int32(),
+    }
+    return pa.table({k: pa.array(v, type=types.get(k)) for k, v in cols.items()})

@@ -1,0 +1,83 @@
+# configs/vllm.yaml — engine + sampling, COPIED FROM THE SOURCE PIPELINE.
+#
+# There are NO <<<TIANJIAN>>> placeholders in this file, and there is nothing here for
+# either of you to tune. Every value was read out of the source pipeline or out of its
+# runtime logs; changing any of them changes generation behaviour and destroys
+# comparability between the 12 jobs and the original JHU run.
+#
+# The ONLY value resolved at runtime is the number of data-parallel worker processes,
+# which comes from cluster.yaml -> compute.num_gpus.
+
+model:
+  repo_id: Qwen/Qwen2.5-7B-Instruct
+  # The source loaded this from a local directory with no recorded revision, so there is
+  # no commit sha to port. 'main' is used, and preflight's overhead gate (150/185) is the
+  # real guard: if the chat template ever changes, those integers move and preflight fails
+  # before any GPU time is spent. Pin a sha here if you want belt-and-braces.
+  revision: main
+  local_subdir: qwen2.5-7b-instruct
+
+llama2_tokenizer:
+  # Source used a local dir; its own tokenizer_report.json records source_repo =
+  # unsloth/llama-2-7b, LlamaTokenizer, vocab_size 32000. Used ONLY to count output
+  # tokens, as len(tok(text, add_special_tokens=False).input_ids) — no BOS.
+  repo_id: unsloth/llama-2-7b
+  revision: main
+  local_subdir: llama2-unsloth-tokenizer
+  allow_patterns: ["tokenizer.json", "tokenizer_config.json", "tokenizer.model",
+                   "special_tokens_map.json"]
+  expected_vocab_size: 32000
+
+# Exactly the five kwargs the source passed to LLM(). Adding a key here is a config
+# error, not a feature -- config.py rejects anything outside this set.
+#   source: 07_rewrite/rewrite_worker.py:240-241, 09_Distill/rewrite_worker.py
+engine:
+  tensor_parallel_size: 1        # MUST stay 1. Data parallelism is N independent
+                                 # single-GPU processes, exactly as the source did it
+                                 # with an 8-way SLURM array. vLLM's own
+                                 # data_parallel_size was never used.
+  dtype: bfloat16
+  gpu_memory_utilization: 0.85   # From sbatch_template.sh (BOTH passes) and confirmed by
+                                 # every runtime log. The 0.90 in the source's argparse
+                                 # default and READMEs was never actually used --
+                                 # see docs/SOURCE_INVENTORY.md section 3.3.
+  max_model_len: 32768
+
+# vLLM 0.22.0 defaults the source silently relied on. RECORDED FOR THE READER, NEVER
+# PASSED. Transcribed from the engine's own config dump in
+# 09_Distill/logs/ds_diversity-first_1591082_0.out.
+inherited_defaults_do_not_pass:
+  max_num_batched_tokens: 16384   # chunked prefill
+  enable_prefix_caching: true
+  enable_chunked_prefill: true
+  enforce_eager: false
+  seed: 0
+  quantization: null
+  data_parallel_size: 1
+  pipeline_parallel_size: 1
+  trust_remote_code: false
+  load_format: auto
+  kv_cache_dtype: auto
+  swap_space: 4                  # GiB, vLLM default; source never set it
+  cudagraph_mode: FULL_AND_PIECEWISE
+
+# source: 07_rewrite/rewrite_worker.py:294-296
+#   max_new = min(max_tokens, max_model_len - n_in)
+#   SamplingParams(temperature=0, top_p=1.0, max_tokens=max(1, max_new))
+# A LIST of SamplingParams is built, one per kept document.
+# NOT SET ANYWHERE IN THE SOURCE, and must not be added:
+#   top_k, min_tokens, stop, stop_token_ids, seed, repetition_penalty,
+#   presence_penalty, frequency_penalty, n, skip_special_tokens,
+#   include_stop_str_in_output, logprobs, best_of
+sampling:
+  temperature: 0
+  top_p: 1.0
+  max_tokens: 4096
+
+# Chat template application, source: rewrite_worker.py:285-287.
+# A single user message; NO system message is authored -- Qwen's own template injects
+# "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+chat:
+  add_generation_prompt: true
+  tokenize: false
+  role: user

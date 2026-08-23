@@ -1,0 +1,31 @@
+# ---- secrets ----
+.env
+
+# ---- generated data (never commit; this repo produces terabytes) ----
+*.jsonl
+*.jsonl.zst
+*.parquet
+*.arrow
+*.npy
+*.done
+*.tmp
+
+# ---- large local trees ----
+logs/
+models/
+data/
+out/
+_smoke/
+manifests/*.json
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ---- os / editor ----
+.DS_Store
+*.swp

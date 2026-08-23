@@ -1,0 +1,153 @@
+# configs/data.yaml -- THE WORKLOAD. Wytro fills this in before handoff.
+#
+# The blanks below are Wytro's to fill. Everything NOT marked is fixed by the workload
+# specification or copied from the source pipeline and must not be edited.
+#
+# Six arms. Five are rewritten; quality-base is the CONTROL and is never rewritten --
+# it is downloaded and verified only, so the token accounting is complete.
+#
+#   arm                  prompts   rewrite jobs
+#   quality-base            0         0   <- control
+#   quality-first           2         2
+#   diversity-oriented      2         2
+#   disagreement-aware      2         2
+#   wrap-inspired           4         4
+#   rewire-inspired         2         2
+#                                    12
+#
+# SEMANTICS -- the thing that is easiest to get wrong:
+# EACH PROMPT REWRITES THE ENTIRE DATASET FOR ITS ARM. Prompts are NOT partitioned across
+# documents, NOT sampled per document, NOT round-robined. wrap-inspired with 4 prompts
+# means 4 COMPLETE PASSES over the whole wrap-inspired corpus, producing 4 output shard
+# sets. This is asserted in code: output row count per (arm, prompt) must equal the arm's
+# input row count, or the job fails.
+
+expected_jobs: 12          # hard-asserted against the enumeration below
+
+semantics:
+  # See the note above. Enforced by rewrite.verify.verify_job().
+  # NOTE: this DIFFERS from the source pipeline, where the wrap arm assigned ONE of four
+  # styles per document via np.random.default_rng([42, shard_index]) -- a single pass, not
+  # four. Deliberate change; see docs/HANDOFF_REVIEW.md.
+  full_cross_product: true
+
+sharding:
+  text_column: text
+  # A shard is the unit of work, of resume, and of the row-conservation proof.
+  # A shard closes when EITHER limit is hit, so one pathological long-document shard
+  # cannot become a multi-hour work unit.
+  shard_target_rows: 10000
+  shard_target_bytes: 268435456     # 256 MiB of raw UTF-8 text
+  # Modulo shard assignment (si % num_workers == worker_id) only balances when shards
+  # greatly outnumber workers. The source had 200 shards for 8 workers = 25:1.
+  min_shards_per_gpu: 20
+
+output:
+  format: jsonl
+  # The 10 keys written per row. status and n_output_tokens_llama2 are beyond the 8-key
+  # spec because the ported trim logic filters on status==2 and the token budget is
+  # counted in Llama-2 tokens, exactly as the source did.
+  keys: [doc_id, arm, prompt_id, source_text_sha1, rewritten_text, finish_reason,
+         n_prompt_tokens, n_output_tokens, status, n_output_tokens_llama2]
+  # Sizing model used by scripts/preflight.py for its free-disk check. Stated here so the
+  # estimate is auditable rather than magic:
+  #   bytes ~= bytes_per_output_token * output_tokens + bytes_per_row_overhead * rows
+  # 4.2 B/token = ~3.8 chars/token of UTF-8 English + ~10% JSON string escaping.
+  # 220 B/row  = the JSON envelope (keys, doc_id, 40-char sha1, counts, punctuation).
+  bytes_per_output_token: 4.2
+  bytes_per_row_overhead: 220
+  # Your stated scale, used for the total estimate when row counts are not yet known.
+  est_output_tokens_per_arm: 100000000000
+
+shuffle:
+  # All three copied from the source (pp_io.py / 03_mix_shared_top.py). Do not change:
+  # the seed and rows_per_shard define the output, and inflate feeds the bucket-count
+  # formula that keeps the shuffle inside RAM.
+  seed: 42
+  rows_per_shard: 500000
+  inflate: 4.0
+  # Shuffling is within (arm, prompt) ONLY -- never across arms.
+  scope: arm_prompt
+
+postprocess:
+  # Source parity: the source trimmed shards in place via atomic .tmp + os.replace.
+  # Set false to write to out_root/trimmed/ instead, at the cost of a second full copy.
+  in_place: true
+
+upload:
+  # One repo per (arm, prompt). {arm} and {prompt_id} are substituted.
+  repo_template: "<<<WYTRO: output HF repo id template, e.g. your-org/rewrite-{arm}-{prompt_id}>>>"
+  private: true
+  stage: shuffled            # raw | trimmed | shuffled
+
+# ---------------------------------------------------------------------------------------
+# Prompt definitions. The four fields carry the source's per-prompt asymmetry; the prompt
+# TEXT lives in prompts/<arm>/<id>.txt and is byte-identical to the source.
+#
+#   mode              grounded -> prompt.replace("[TEXT]", doc)   (source: build_content)
+#                     wrap     -> prompt + doc  (prompt already ends "\n\nPassage:\n")
+#   trim              which ported trim rule applies (docs/POSTPROCESSING.md)
+#   input_drop        status=0 threshold on the TEMPLATED token count.
+#                     null => derived as max_model_len - max_tokens = 28672, so every kept
+#                     doc gets the full 4096-token output budget (source: 09_Distill).
+#   expected_overhead empty-document chat-templated token count. A PARITY GATE: preflight
+#                     asserts it, so a changed prompt/template/tokenizer is caught before
+#                     any GPU time is spent. 185 is the value the source itself logged.
+# ---------------------------------------------------------------------------------------
+prompt_defs:
+  p1_wiki:    {mode: grounded, trim: wiki,    input_drop: 30720, expected_overhead: 150}
+  p2_distill: {mode: grounded, trim: distill, input_drop: null,  expected_overhead: 185}
+  wrap_easy:  {mode: wrap,     trim: wrap,    input_drop: 30720, expected_overhead: 72}
+  wrap_hard:  {mode: wrap,     trim: wrap,    input_drop: 30720, expected_overhead: 66}
+  wrap_wiki:  {mode: wrap,     trim: wrap,    input_drop: 30720, expected_overhead: 73}
+  wrap_qa:    {mode: wrap,     trim: wrap,    input_drop: 30720, expected_overhead: 83}
+
+arms:
+  - name: quality-base
+    repo_id: "<<<WYTRO: HF dataset repo id for quality-base (the CONTROL arm)>>>"
+    revision: main
+    rewrite: false          # CONTROL -- downloaded and verified only, never rewritten
+    prompts: []
+
+  - name: quality-first
+    repo_id: "<<<WYTRO: HF dataset repo id for quality-first>>>"
+    revision: main
+    rewrite: true
+    prompts:
+      - {id: p1, file: prompts/quality-first/p1.txt, def: p1_wiki}
+      - {id: p2, file: prompts/quality-first/p2.txt, def: p2_distill}
+
+  - name: diversity-oriented
+    repo_id: "<<<WYTRO: HF dataset repo id for diversity-oriented>>>"
+    revision: main
+    rewrite: true
+    prompts:
+      - {id: p1, file: prompts/diversity-oriented/p1.txt, def: p1_wiki}
+      - {id: p2, file: prompts/diversity-oriented/p2.txt, def: p2_distill}
+
+  - name: disagreement-aware
+    repo_id: "<<<WYTRO: HF dataset repo id for disagreement-aware>>>"
+    revision: main
+    rewrite: true
+    prompts:
+      - {id: p1, file: prompts/disagreement-aware/p1.txt, def: p1_wiki}
+      - {id: p2, file: prompts/disagreement-aware/p2.txt, def: p2_distill}
+
+  - name: wrap-inspired
+    repo_id: "<<<WYTRO: HF dataset repo id for wrap-inspired>>>"
+    revision: main
+    rewrite: true
+    # FOUR COMPLETE PASSES over the whole corpus -- one per style, not one style per doc.
+    prompts:
+      - {id: p1, file: prompts/wrap-inspired/p1.txt, def: wrap_easy}
+      - {id: p2, file: prompts/wrap-inspired/p2.txt, def: wrap_hard}
+      - {id: p3, file: prompts/wrap-inspired/p3.txt, def: wrap_wiki}
+      - {id: p4, file: prompts/wrap-inspired/p4.txt, def: wrap_qa}
+
+  - name: rewire-inspired
+    repo_id: "<<<WYTRO: HF dataset repo id for rewire-inspired>>>"
+    revision: main
+    rewrite: true
+    prompts:
+      - {id: p1, file: prompts/rewire-inspired/p1.txt, def: p1_wiki}
+      - {id: p2, file: prompts/rewire-inspired/p2.txt, def: p2_distill}
