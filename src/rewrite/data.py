@@ -16,6 +16,8 @@ import hashlib
 import json
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -92,6 +94,7 @@ class Manifest:
     shards: list
     doc_id_policy: str = DOC_ID_POLICY
     total_tokens_llama2: int | None = None
+    doc_id_source: str = "unknown"      # "dataset" | "synthesized"
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2)
@@ -230,8 +233,47 @@ def claim_path(job_output_dir: Path, si: int) -> Path:
     return Path(job_output_dir) / f"part_{si:05d}.claim"
 
 
+def fs_now(directory: Path) -> float:
+    """'Now', as the FILESYSTEM sees it.
+
+    Claim ages are compared across nodes, and mtimes are stamped by whichever node wrote
+    them. Comparing those against a local time.time() would be at the mercy of clock skew
+    between nodes -- which on a two-week run is exactly the sort of thing that silently
+    causes a live claim to look stale. So we stamp a probe file on the same filesystem and
+    read its mtime back: both timestamps then come from the same clock.
+    """
+    d = Path(directory)
+    probe = d / f".now.{os.getpid()}"
+    try:
+        probe.touch()
+        return probe.stat().st_mtime
+    except OSError:
+        return time.time()          # last resort; better than refusing to reap at all
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
+def claim_age_s(job_output_dir: Path, si: int, now: float | None = None) -> float:
+    """Seconds since this claim was last heartbeated. inf if there is no claim."""
+    cp = claim_path(job_output_dir, si)
+    try:
+        mt = cp.stat().st_mtime
+    except OSError:
+        return float("inf")
+    if now is None:
+        now = fs_now(job_output_dir)
+    return max(0.0, now - mt)
+
+
 def try_claim(job_output_dir: Path, si: int, owner: dict) -> bool:
-    """Atomically claim shard `si`. True if this worker got it."""
+    """Atomically claim shard `si`. True if this worker got it.
+
+    os.mkdir is atomic on every POSIX filesystem INCLUDING NFS, where O_CREAT|O_EXCL is
+    not reliably so. That is what makes claiming safe across nodes as well as within one.
+    """
     cp = claim_path(job_output_dir, si)
     try:
         cp.mkdir()                      # atomic: exactly one worker wins
@@ -242,6 +284,43 @@ def try_claim(job_output_dir: Path, si: int, owner: dict) -> bool:
     except OSError:
         pass
     return True
+
+
+def heartbeat_claim(job_output_dir: Path, si: int) -> None:
+    """Refresh a claim's mtime so other nodes can see the owner is still alive."""
+    try:
+        os.utime(claim_path(job_output_dir, si), None)
+    except OSError:
+        pass
+
+
+class ClaimHeartbeat:
+    """Touch a claim while its shard is being generated.
+
+    Without this there is no way for another node to tell a live claim from one orphaned
+    by a crash: the worker is blocked inside llm.generate() for the whole shard and cannot
+    update anything from the main thread. A daemon thread ticking every `interval` seconds
+    gives every claim a liveness signal that is visible on the shared filesystem.
+    """
+
+    def __init__(self, job_output_dir: Path, si: int, interval: float = 60.0):
+        self.dir, self.si, self.interval = Path(job_output_dir), si, interval
+        self._stop = threading.Event()
+        self._th = None
+
+    def __enter__(self):
+        def tick():
+            while not self._stop.wait(self.interval):
+                heartbeat_claim(self.dir, self.si)
+        self._th = threading.Thread(target=tick, daemon=True)
+        self._th.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._th is not None:
+            self._th.join(timeout=2.0)
+        return False
 
 
 def release_claim(job_output_dir: Path, si: int) -> None:
@@ -257,24 +336,41 @@ def release_claim(job_output_dir: Path, si: int) -> None:
         pass
 
 
-def reap_stale_claims(job_output_dir: Path, log=print) -> int:
-    """Remove claims left behind by a previous, now-dead run.
+def reap_stale_claims(job_output_dir: Path, stale_after_s: float | None = 1800.0,
+                      force: bool = False, log=print) -> int:
+    """Remove claims that no live worker can still be holding.
 
-    Called ONCE by the launcher before any worker starts, which is what makes it safe: at
-    that moment no worker of this run is alive, so every claim without a matching .done
-    belongs to a run that died. Workers never call this -- doing so would let one worker
-    steal a live claim from another.
+    MULTI-NODE SAFETY. An earlier version removed EVERY claim it found, on the reasoning
+    that the launcher holds the job lock and no worker of "this run" has started yet. That
+    reasoning holds on one node and is false on twelve: node 2's launcher would wipe node
+    1's live claims, two workers would generate the same shard, and because each shard is
+    written atomically with last-writer-wins, row conservation would still pass. The waste
+    and the nondeterministic choice of surviving output would both be silent.
+
+    So reaping is now safe by construction rather than by instruction:
+      * a claim whose shard already has a .done is litter and always goes;
+      * any other claim goes only if it has not been heartbeated for `stale_after_s`,
+        which a live worker refreshes every 60s (see ClaimHeartbeat).
+
+    force=True restores the old remove-everything behaviour. It is for an operator who
+    KNOWS nothing is running, and it is never used by the launcher.
     """
     d = Path(job_output_dir)
     if not d.exists():
         return 0
-    n = 0
+    now = fs_now(d)
+    n = kept = 0
     for cp in sorted(d.glob("part_*.claim")):
-        si = int(cp.name.split("_")[1].split(".")[0])
-        done = [p for p in d.glob(f"part_{si:05d}.done")]
-        if done:
-            # completed; the claim is just litter
-            pass
+        try:
+            si = int(cp.name.split("_")[1].split(".")[0])
+        except (IndexError, ValueError):
+            continue
+        finished = any(d.glob(f"part_{si:05d}.done"))
+        if not (force or finished):
+            age = max(0.0, now - cp.stat().st_mtime) if cp.exists() else float("inf")
+            if stale_after_s is not None and age < stale_after_s:
+                kept += 1
+                continue                      # a live worker is holding this
         try:
             (cp / "owner.json").unlink()
         except OSError:
@@ -284,8 +380,9 @@ def reap_stale_claims(job_output_dir: Path, log=print) -> int:
             n += 1
         except OSError:
             pass
-    if n:
-        log(f"[claims] reaped {n} stale claim(s) from a previous run in {d}")
+    if n or kept:
+        log(f"[claims] reaped {n} stale/finished claim(s); left {kept} live claim(s) "
+            f"alone in {d}")
     return n
 
 
@@ -355,11 +452,65 @@ def shard_arm(cfg: Config, arm_name: str, log=print, count_tokens: bool = False)
             f"{man.n_shards} shards) -> skip")
         return man
 
-    ds = _open_dataset(cfg, a, streaming=False)
+    # Multi-node: several nodes may reach this at once on a fresh data_root. Exactly one
+    # should shard; the rest wait for the manifest rather than racing to write the same
+    # files. Atomic mkdir again, for the same reason claims use it.
+    lock = out_dir / ".sharding.lock"
+    try:
+        lock.mkdir()
+        holder = True
+    except FileExistsError:
+        holder = False
+    if not holder:
+        log(f"[data] {a.name}: another process is sharding this arm; waiting for its "
+            f"manifest ...")
+        waited = 0
+        while not existing.exists():
+            time.sleep(10)
+            waited += 10
+            if waited % 600 == 0:
+                log(f"[data] {a.name}: still waiting ({waited // 60} min). If no other "
+                    f"process is running, remove {lock} and re-run.")
+        log(f"[data] {a.name}: manifest appeared -> skip")
+        return Manifest.from_json(existing.read_text())
+
+    try:
+        ds = _open_dataset(cfg, a, streaming=False)
+    except BaseException:
+        try:
+            lock.rmdir()
+        except OSError:
+            pass
+        raise
     if col not in ds.column_names:
         stop(f"{a.name}: no {col!r} column; columns are {ds.column_names}")
 
+    # §3: doc_id is the join key back to the input corpus. If the dataset supplies one it
+    # is durable and independent of how this pipeline shards. If it does not, we synthesize
+    # a row index -- reproducible, but only meaningful relative to OUR sharding, which makes
+    # data_root/shards/ load-bearing forever. That difference is consequential enough to be
+    # a decision rather than a silent fallback.
     has_doc_id = "doc_id" in ds.column_names
+    require = bool(sh.get("require_doc_id", True))
+    if not has_doc_id:
+        msg = (f"{a.name}: dataset {a.repo_id} has NO 'doc_id' column "
+               f"(columns: {ds.column_names}).\n"
+               f"  doc_id is the key that joins rewritten output back to the input corpus "
+               f"-- topic labels, quality scores, anything not carried in the 10-key output "
+               f"schema.\n"
+               f"  Without it this pipeline synthesizes a row index, which is deterministic "
+               f"but only meaningful relative to this sharding: data_root/shards/ then has "
+               f"to survive for the join to remain possible.\n"
+               f"  FIX (cheap, and permanent): add an explicit doc_id column to the dataset "
+               f"and re-upload.\n"
+               f"  OVERRIDE: set sharding.require_doc_id: false in configs/data.yaml to "
+               f"accept the synthesized index. That choice is recorded in the manifest.")
+        if require:
+            stop(msg)
+        log("[data] WARNING " + "-"*58)
+        for line in msg.splitlines():
+            log("[data] " + line)
+        log("[data] " + "-"*65)
     ltok = None
     if count_tokens:
         from .engine import load_llama2_tokenizer
@@ -423,24 +574,41 @@ def shard_arm(cfg: Config, arm_name: str, log=print, count_tokens: bool = False)
         total_rows=total_rows, total_text_bytes=total_bytes, content_sha1=content_sha1,
         n_shards=len(shards), shards=shards,
         total_tokens_llama2=(total_tok if count_tokens else None),
+        doc_id_source=("dataset" if has_doc_id else "synthesized"),
     )
 
     if a.rewrite:
         min_ratio = int(sh["min_shards_per_gpu"])
         need = min_ratio * cfg.num_gpus
         if man.n_shards < need:
+            # Do the arithmetic here rather than leaving it to be discovered. At 100 GPUs
+            # the shipped default of 10,000 rows/shard fails this for most arms, and the
+            # useful output is the number to use, not the fact that the current one is
+            # wrong.
+            suggested = max(200, (total_rows // need) // 100 * 100)
             stop(
                 f"{a.name}: only {man.n_shards} shards for {cfg.num_gpus} GPUs "
-                f"({man.n_shards / cfg.num_gpus:.1f}:1). Shards are assigned "
-                f"round-robin (shard_index % num_gpus), which only balances when shards "
-                f"greatly outnumber workers -- the source ran 200 shards over 8 workers "
-                f"(25:1).\n  Lower configs/data.yaml sharding.shard_target_rows so there "
-                f"are at least {need} shards, delete {out_dir}, and re-run."
+                f"({man.n_shards / cfg.num_gpus:.1f}:1), below the required "
+                f"{min_ratio}:1.\n"
+                f"  A shard is the unit of work, so when shards barely outnumber workers "
+                f"the tail of every job leaves most GPUs idle.\n"
+                f"  This arm has {total_rows:,} rows and you have {cfg.num_gpus} GPUs, so "
+                f"it needs >= {need:,} shards.\n"
+                f"  SET configs/data.yaml sharding.shard_target_rows: {suggested}   "
+                f"(currently {target_rows})\n"
+                f"  Then delete {out_dir} and re-run 02_download_data.py.\n"
+                f"  DECIDE THIS BEFORE JOB 1: shard size feeds the manifest fingerprint, so "
+                f"changing it after generation starts invalidates every .done marker."
             )
 
     atomic_write_text(man.to_json(), manifest_path(cfg, a.name))
+    try:
+        lock.rmdir()
+    except OSError:
+        pass
     log(f"[data] {a.name}: {total_rows:,} rows, {len(shards)} shards, "
-        f"{total_bytes/2**30:.1f} GiB text, content_sha1={content_sha1[:12]}")
+        f"{total_bytes/2**30:.1f} GiB text, doc_id={man.doc_id_source}, "
+        f"content_sha1={content_sha1[:12]}")
     return man
 
 
@@ -453,7 +621,7 @@ def write_data_manifest(cfg: Config, log=print) -> Path:
             "repo_id": man.repo_id, "revision": man.revision, "rewrite": man.rewrite,
             "total_rows": man.total_rows, "total_text_bytes": man.total_text_bytes,
             "content_sha1": man.content_sha1, "fingerprint": man.fingerprint,
-            "n_shards": man.n_shards,
+            "n_shards": man.n_shards, "doc_id_source": man.doc_id_source,
             "total_tokens_llama2": man.total_tokens_llama2,
             "n_prompts": len(a.prompts),
             "n_rewrite_jobs": len(a.prompts) if a.rewrite else 0,

@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 from pathlib import Path
@@ -30,6 +31,9 @@ from pathlib import Path
 from . import data as D
 from .config import (Config, JobSpec, enumerate_jobs, get_job, load_config,
                      resolve_drop_threshold, stop)
+
+
+HOST = socket.gethostname().split(".")[0]
 
 
 def log(msg: str) -> None:
@@ -134,13 +138,16 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
         "total_input_tokens": 0, "total_output_tokens": 0,
         "total_output_tokens_llama2": 0, "elapsed_seconds": 0.0, "last_updated": None,
     }
+    # Node-qualified: on a multi-node run every node has a worker 0, and without the
+    # hostname node 2's worker 0 silently overwrites node 1's. Progress reporting is how
+    # anyone knows whether a two-week run is healthy, so it has to survive the fan-out.
     progress_path = (cfg.paths["log_root"] / job.arm / job.prompt.id /
-                     f"progress_w{worker_id}.json")
+                     f"progress_{HOST}_w{worker_id}.json")
     progress_path.parent.mkdir(parents=True, exist_ok=True)
 
-    owner = {"worker_id": worker_id, "pid": os.getpid(),
-             "host": __import__("socket").gethostname(),
+    owner = {"worker_id": worker_id, "pid": os.getpid(), "host": HOST,
              "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    stale_after = float(cfg.cluster["compute"].get("claim_stale_after_s", 1800))
     claimed = None
 
     llm = None
@@ -167,7 +174,17 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
 
         if assignment != "static":
             if not D.try_claim(job.output_dir, si, owner):
-                continue                      # another worker has it
+                # Someone holds it. If that claim has not been heartbeated in
+                # stale_after seconds its owner is gone -- a killed process, a lost node --
+                # so take it over. Without this a node dying mid-run would strand its
+                # in-flight shards until somebody noticed and restarted the job.
+                if D.claim_age_s(job.output_dir, si) < stale_after:
+                    continue                  # a live worker has it
+                log(f"[w{worker_id}] shard {si:05d} claim is stale "
+                    f"(>{stale_after:.0f}s since heartbeat) -> taking it over")
+                D.release_claim(job.output_dir, si)
+                if not D.try_claim(job.output_dir, si, owner):
+                    continue                  # another worker beat us to the takeover
             # Re-check after winning the claim: a worker may have finished this shard
             # between our .done test above and the claim succeeding.
             if done_path.exists():
@@ -214,13 +231,17 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
         shas = table.column("source_text_sha1").to_pylist()
 
         t0 = time.perf_counter()
-        prep = E.prepare_batch(qtok, cfg, texts, job.prompt, drop_threshold)
-        res = E.run_batch(llm, prep)
-        n_llama = [0] * n_rows
-        if prep.keep_idx:
-            counts = E.count_llama2(ltok, [res.rewritten[j] for j in prep.keep_idx])
-            for j, c in zip(prep.keep_idx, counts):
-                n_llama[j] = c
+        # Hold a liveness signal on the claim for the whole shard. The main thread is
+        # blocked inside llm.generate(), so a background tick is the only way another node
+        # can distinguish "still working" from "died holding this".
+        with D.ClaimHeartbeat(job.output_dir, si, interval=min(60.0, stale_after / 5)):
+            prep = E.prepare_batch(qtok, cfg, texts, job.prompt, drop_threshold)
+            res = E.run_batch(llm, prep)
+            n_llama = [0] * n_rows
+            if prep.keep_idx:
+                counts = E.count_llama2(ltok, [res.rewritten[j] for j in prep.keep_idx])
+                for j, c in zip(prep.keep_idx, counts):
+                    n_llama[j] = c
         dt = time.perf_counter() - t0
 
         lines = []
@@ -261,6 +282,7 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
         # Sidecar AFTER the data file's rename -- see data.write_sidecar for why.
         D.write_sidecar(out_path, {
             "shard_index": si, "job_id": job.job_id, "worker_id": worker_id,
+            "host": HOST,
             "n_rows_in": n_rows, "n_rows_out": len(lines),
             "input_fingerprint": man.fingerprint,
             "status_0": s0, "status_1": s1, "status_2": s2,
@@ -355,8 +377,12 @@ def main(argv=None) -> int:
     ap.add_argument("--deep-verify", action="store_true",
                     help="with --verify: also count lines in every output shard")
     ap.add_argument("--reap-claims", action="store_true",
-                    help="clear shard claims left by a dead run. The launcher calls this "
-                         "ONCE before starting workers; never run it while workers are up")
+                    help="clear shard claims whose owner is gone (no heartbeat for "
+                         "compute.claim_stale_after_s). Safe to run while other nodes are "
+                         "working -- live claims are left alone")
+    ap.add_argument("--force", action="store_true",
+                    help="with --reap-claims: clear EVERY claim regardless of liveness. "
+                         "Only when you know nothing is running anywhere.")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config_root)
@@ -370,7 +396,10 @@ def main(argv=None) -> int:
     job = get_job(cfg, args.arm, args.prompt_id)
 
     if args.reap_claims:
-        D.reap_stale_claims(job.output_dir)
+        D.reap_stale_claims(
+            job.output_dir,
+            stale_after_s=float(cfg.cluster["compute"].get("claim_stale_after_s", 1800)),
+            force=args.force)
         return 0
 
     if args.verify:

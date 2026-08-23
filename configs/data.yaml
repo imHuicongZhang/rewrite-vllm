@@ -61,14 +61,39 @@ compute_constraints:
 
 sharding:
   text_column: text
-  # A shard is the unit of work, of resume, and of the row-conservation proof.
-  # A shard closes when EITHER limit is hit, so one pathological long-document shard
-  # cannot become a multi-hour work unit.
-  shard_target_rows: 10000
+
+  # DECIDE shard_target_rows BEFORE JOB 1 AND DO NOT CHANGE IT.
+  # It feeds the manifest fingerprint, so changing it after generation has started
+  # renumbers doc_id and invalidates every .done marker -- i.e. throws the run away.
+  #
+  # A shard is the unit of work, of resume, and of the row-conservation proof, so its
+  # size trades tail-idle against per-shard overhead. Sized for ~100 GPUs:
+  #
+  #   rows   shard @8k tok/s   tail idle over 12 jobs   shards for a 5.6M-doc arm
+  #   10000     11.5 min            2.3 GPU-hours          561   <- FAILS the 20:1 guard
+  #    5000      5.7 min            1.1 GPU-hours         1121   <- FAILS at 100 GPUs
+  #    2000      2.3 min            0.5 GPU-hours         2802   <- fits, 28:1
+  #    1000      1.1 min            0.2 GPU-hours         5603   more files, thinner batches
+  #
+  # 2000 is the choice: it satisfies 20:1 for every arm at 100 GPUs, keeps the tail under
+  # a few minutes, and still gives vLLM a batch far larger than its default max_num_seqs.
+  # At 8 GPUs anything from 2000 to 10000 works; 2000 is fine there too.
+  shard_target_rows: 2000
+
+  # Secondary cap, so one run of very long documents cannot become a multi-hour shard.
   shard_target_bytes: 268435456     # 256 MiB of raw UTF-8 text
-  # Modulo shard assignment (si % num_workers == worker_id) only balances when shards
-  # greatly outnumber workers. The source had 200 shards for 8 workers = 25:1.
+
+  # Shards must comfortably outnumber workers or the tail of each job idles the fleet.
+  # The source ran 200 shards over 8 workers (25:1). 02_download_data.py refuses below
+  # this and tells you what to set shard_target_rows to.
   min_shards_per_gpu: 20
+
+  # doc_id is the key that joins rewritten output back to the input corpus. Requiring the
+  # datasets to carry their own makes that key durable and independent of this pipeline's
+  # sharding. Set false ONLY if a dataset genuinely cannot supply one; the fallback is a
+  # synthesized row index, which is deterministic but ties the join to data_root/shards/
+  # surviving. Whichever applies is recorded per arm in the manifest as doc_id_source.
+  require_doc_id: true
 
 output:
   format: jsonl
@@ -161,6 +186,35 @@ arms:
       - {id: p1, file: prompts/disagreement-aware/p1.txt, def: p1_wiki}
       - {id: p2, file: prompts/disagreement-aware/p2.txt, def: p2_distill}
 
+  # -------------------------------------------------------------------------------------
+  # SELECTION CAVEAT FOR wrap-inspired -- read before subsampling this arm.
+  #
+  # Every other arm rewrites each document TWICE (wiki + distill). wrap-inspired rewrites
+  # each document FOUR times, once per style, so its pool carries 4 copies per source
+  # document where the others carry 2.
+  #
+  # At a fixed token budget this does NOT automatically mean more duplication. Under
+  # UNIFORM subsampling to a budget B, expected copies per document is
+  #     n_passes x B / pool  =  B / (tokens_per_pass_per_doc x n_docs)
+  # which is independent of the pass count -- a bigger pool is met with a smaller
+  # fraction of it. Worked at B = 5B tokens using the original run's measured figures:
+  #     quality-first       pool  5.98B   84% needed   1.67 copies/doc
+  #     wrap-inspired       pool 16.7B    30% needed   1.20 copies/doc
+  # So wrap ends up with LESS duplication than quality-first, not more.
+  #
+  # Under QUALITY-RANKED selection this reverses. A good document's four rewrites all
+  # score well together, so duplication concentrates on the documents that rank highest --
+  # exactly the ones the budget is spent on. The original pipeline was already alert to
+  # this: for the wrap arm specifically it supplemented with a seeded RANDOM draw rather
+  # than a quality sort, recorded in its own manifest as
+  #     "distill_selection": "seeded_random_seed42_no_quality_sort"
+  # explicitly to keep that arm comparable with the others.
+  #
+  # If you are the person deciding how to cut this arm to a token budget: compute and
+  # report copies-per-document for every arm rather than assuming symmetry, and prefer a
+  # uniform or seeded-random draw over a quality sort unless you have a reason not to.
+  # Full analysis: docs/HANDOFF_REVIEW.md, C1.
+  # -------------------------------------------------------------------------------------
   - name: wrap-inspired
     repo_id: "<<<WYTRO: HF dataset repo id for wrap-inspired>>>"
     revision: main

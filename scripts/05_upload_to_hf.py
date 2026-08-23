@@ -57,6 +57,96 @@ def repo_name(cfg, job) -> str:
     return tpl.format(arm=job.arm, prompt_id=job.prompt.id)
 
 
+WRAP_CAVEAT = """
+## Selection caveat — read before subsampling this arm
+
+This arm was rewritten with **four prompts**, so its pool carries **four rewrites per
+source document**, where every other arm carries two (one wiki-style, one distill).
+
+At a fixed token budget that does **not** automatically mean more duplication. Under
+*uniform* subsampling to a budget `B`, expected copies per document is
+`n_passes x B / pool`, and since `pool ~ n_passes x tokens_per_pass`, that reduces to a
+quantity independent of the pass count — a larger pool is met with a smaller fraction of
+it. Worked at `B` = 5B tokens, using the originating run's measured figures:
+
+| arm | pool | fraction needed | expected copies/doc |
+|---|---:|---:|:--:|
+| quality-first | 5.98B | 84% | 1.67 |
+| wrap-inspired | 16.7B | 30% | **1.20** |
+
+So under uniform sampling this arm ends up with *less* per-document duplication than
+quality-first, not more.
+
+**Under quality-ranked selection this reverses.** A good document's four rewrites all
+score well together, so duplication concentrates on exactly the documents a
+quality-sorted budget spends itself on. The originating pipeline was already alert to
+this: for this arm specifically it supplemented with a seeded *random* draw rather than a
+quality sort, recorded in its own manifest as
+`"distill_selection": "seeded_random_seed42_no_quality_sort"`, to keep the arm comparable
+with the others.
+
+If you are deciding how to cut this arm to a token budget: compute and report
+copies-per-document for every arm rather than assuming symmetry, and prefer a uniform or
+seeded-random draw over a quality sort unless you have a specific reason not to.
+"""
+
+
+def dataset_card(cfg, job, files, nbytes) -> str:
+    """A README.md for the Hub repo.
+
+    The point is that whoever later decides how to subsample these datasets may be neither
+    Wytro nor Tianjian, and will meet the data long after this repository. Anything they
+    need in order not to misuse it has to travel with the data, not sit in a review doc.
+    """
+    arm = cfg.arm(job.arm)
+    drop, derived = __import__("rewrite.config", fromlist=["x"]).resolve_drop_threshold(
+        job.prompt, cfg.max_model_len, cfg.max_tokens)
+    eng, smp = cfg.vllm["engine"], cfg.vllm["sampling"]
+    n_prompts = len(arm.prompts)
+    card = f"""---
+tags: [synthetic, rewritten, {job.arm}]
+---
+
+# {job.arm} — prompt {job.prompt.id}
+
+One of **{n_prompts}** rewrites of the `{job.arm}` corpus. Each prompt rewrites the
+**entire** corpus, so this dataset has exactly as many rows as the input
+and `{job.arm}` has {n_prompts} datasets that differ only in the prompt used.
+
+Generated with `{cfg.vllm['model']['repo_id']}` under vLLM.
+
+## Generation settings
+
+| | |
+|---|---|
+| prompt mode | `{job.prompt.mode}` |
+| trim rule applied | `{job.prompt.trim}` |
+| sampling | greedy: `temperature={smp['temperature']}`, `top_p={smp['top_p']}`, `max_tokens={smp['max_tokens']}` (per document: `min(max_tokens, max_model_len - n_prompt_tokens)`) |
+| engine | `dtype={eng['dtype']}`, `max_model_len={eng['max_model_len']}`, `gpu_memory_utilization={eng['gpu_memory_utilization']}`, `tensor_parallel_size={eng['tensor_parallel_size']}` |
+| over-length documents | **dropped, never truncated**, above {drop} templated tokens{' (derived as max_model_len - max_tokens)' if derived else ''} → `status=0` |
+| shards | {files} files, {nbytes / 2**30:.1f} GiB |
+
+## Columns
+
+| column | meaning |
+|---|---|
+| `doc_id` | identity key; join back to the input corpus on this |
+| `arm`, `prompt_id` | which arm and which of its prompts produced this row |
+| `source_text_sha1` | SHA-1 of the source document (integrity, **not** a join key — duplicate documents share a hash) |
+| `rewritten_text` | model output, with the arm's trim rule applied |
+| `finish_reason` | raw from vLLM |
+| `status` | `0` dropped (too long, never generated) · `1` truncated at the output cap · `2` clean stop |
+| `n_prompt_tokens`, `n_output_tokens` | Qwen tokenizer |
+| `n_output_tokens_llama2` | Llama-2 tokenizer — **use this one for token budgeting**, and add 1 per document for BOS |
+
+Rows with `status != 2` are present but were not cleanly generated. Filter to `status == 2`
+for training use; the others are retained so row counts match the input exactly.
+"""
+    if job.arm == "wrap-inspired":
+        card += WRAP_CAVEAT
+    return card
+
+
 def stage_dir(cfg, job) -> Path:
     stage = cfg.data["upload"]["stage"]
     if stage == "raw":
@@ -131,6 +221,18 @@ def main(argv=None) -> int:
         with_retry(lambda: api.create_repo(repo_id=name, repo_type="dataset",
                                            private=private, exist_ok=True),
                    f"create_repo {name}")
+
+        # Ship the card with the data. For wrap-inspired this is the only place the
+        # selection caveat reaches the person who will subsample it.
+        card = dataset_card(cfg, job, len(files), nbytes)
+        card_p = src / "README.md"
+        D.atomic_write_text(card, card_p)
+        with_retry(lambda: api.upload_file(
+            path_or_fileobj=str(card_p), path_in_repo="README.md",
+            repo_id=name, repo_type="dataset",
+            commit_message="dataset card"), f"upload card {name}")
+        print(f"    card uploaded" + ("  (includes the wrap selection caveat)"
+                                      if job.arm == "wrap-inspired" else ""))
         with_retry(lambda: api.upload_folder(
             repo_id=name, repo_type="dataset", folder_path=str(src),
             path_in_repo="data",

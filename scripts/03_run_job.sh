@@ -89,19 +89,33 @@ if [[ "${#GPU_IDS[@]}" -ne "$NGPU" ]]; then
 fi
 
 LOG_DIR="$LOG_ROOT/$ARM/$PROMPT_ID"
-LOCK_DIR="$OUT_ROOT/raw/$ARM/$PROMPT_ID"
-mkdir -p "$LOG_DIR" "$LOCK_DIR"
-LOCK="$LOCK_DIR/.joblock"
+mkdir -p "$LOG_DIR" "$OUT_ROOT/raw/$ARM/$PROMPT_ID"
+
+# PER-NODE lock, deliberately NOT on the shared filesystem.
+#
+# What the lock is for is stopping two engines landing on the same GPU, which is a
+# per-node concern. The lock used to live in $OUT_ROOT, which on a multi-node run would
+# either block every node after the first or behave according to whatever flock semantics
+# the shared mount happens to implement -- NFS flock is not something to bet a two-week
+# run on. A node-local path gives the lock reliable semantics and the right scope.
+# The hostname is in the filename too, so a shared TMPDIR cannot re-create the problem.
+LOCK_BASE="${TMPDIR:-/tmp}"
+LOCK="$LOCK_BASE/rewrite-vllm.$(hostname -s).${ARM}.${PROMPT_ID}.lock"
 
 exec 9>"$LOCK"
 if ! flock -n 9; then
-  echo "*** STOP: another process is already running $ARM/$PROMPT_ID (lock: $LOCK)." >&2
-  echo "    Jobs must run one at a time -- each one already uses every GPU." >&2
+  echo "*** STOP: $ARM/$PROMPT_ID is already running ON THIS NODE ($(hostname -s))." >&2
+  echo "    lock: $LOCK" >&2
+  echo "    Two engines on one GPU would each try to reserve 85% of it and OOM." >&2
+  echo "    (This lock is per-node by design. Running the same job on OTHER nodes at the" >&2
+  echo "     same time is how multi-node works -- see docs/GUIDE_FOR_TIANJIAN.md section 3.)" >&2
   exit 3
 fi
 
-# Clear shard claims left behind by a run that died. Safe here and ONLY here: we hold the
-# job lock and no worker of this run has started, so any surviving claim is from a dead run.
+# Clear shard claims whose owner is gone. Safe to do here even when other NODES are
+# actively working this job: reaping is age-based, and a live worker heartbeats its claim
+# every 60s, so only claims that have gone quiet for compute.claim_stale_after_s are
+# removed. See src/rewrite/data.py::reap_stale_claims.
 PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
 python -u -m rewrite.run_rewrite --arm "$ARM" --prompt-id "$PROMPT_ID" \
     --config-root "$REPO_ROOT" --reap-claims

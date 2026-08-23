@@ -28,10 +28,34 @@ def main(argv=None) -> int:
     ap.add_argument("--arm", default=None, help="only this arm (default: all six)")
     ap.add_argument("--count-tokens", action="store_true",
                     help="also count Llama-2 tokens (an extra full pass)")
+    ap.add_argument("--wait-only", action="store_true",
+                    help="do not download or shard; just wait until every arm's manifest "
+                         "exists. For worker nodes in a multi-node run, where one node "
+                         "prepares the data and the rest must not race it.")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config_root)
     arms = [cfg.arm(args.arm)] if args.arm else list(cfg.arms)
+
+    if args.wait_only:
+        import time as _t
+        pending = [a for a in arms if a.rewrite]
+        waited = 0
+        while True:
+            missing = [a.name for a in pending if not D.manifest_path(cfg, a.name).exists()]
+            if not missing:
+                break
+            if waited % 300 == 0:
+                print(f"[data] waiting for manifests: {missing} ({waited // 60} min)",
+                      flush=True)
+            _t.sleep(15)
+            waited += 15
+        for a in arms:
+            if a.rewrite:
+                m = D.load_manifest(cfg, a.name)
+                print(f"[data] {a.name}: ready ({m.total_rows:,} rows, {m.n_shards} shards, "
+                      f"doc_id={m.doc_id_source})")
+        return 0
 
     for a in arms:
         tag = "CONTROL, never rewritten" if not a.rewrite else f"{len(a.prompts)} prompts"

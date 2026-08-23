@@ -39,6 +39,9 @@ command is always the correct recovery action.
 **This run is Blackwell only: B200 and B300.** H200 is excluded by design and the code
 enforces it. Read **§2.3** before you start.
 
+If you have more than one node — ~100 GPUs is about a dozen — read **§3.5**; the
+orchestration has roles and one of them must run on a single node.
+
 **What you must supply:** eleven values in `configs/cluster.yaml` and one token in `.env`.
 That is all. Section 2 lists every one.
 
@@ -175,7 +178,10 @@ python3 scripts/check_placeholders.py     # must exit 0
 #    Ends with an 8-document end-to-end smoke test; READ ITS BEFORE/AFTER OUTPUT.
 python scripts/preflight.py
 
-# 4. The whole run: model -> data -> 12 jobs sequentially -> postprocess -> upload.
+# 4. The whole run: model -> data -> calibrate -> 12 jobs -> postprocess -> upload.
+#    Calibration measures real throughput and projects total wall clock BEFORE job 1.
+#    Read that projection: a wrong number is worth noticing on day zero, not day six.
+#    On several nodes, see section 3.5 instead of this line.
 bash scripts/run_all.sh
 
 # 5. Check progress at any time, from any shell.
@@ -196,6 +202,55 @@ python scripts/04_postprocess.py --dry-run --sample 100000   # strip rates, no w
 ```
 
 ---
+
+## 3.5 Running across several nodes
+
+If you have ~100 GPUs that is roughly a dozen nodes, not one. The generation core is
+already multi-node safe — workers claim shards through atomic `mkdir` on the shared output
+directory, so which node does which shard sorts itself out — but the **orchestration has
+roles**, and getting them wrong is the one way to corrupt output rather than just waste
+time.
+
+**Requirements.** `paths.out_root`, `paths.data_root` and `paths.log_root` must be the
+*same shared filesystem* on every node, mounted at the *same path*. `paths.tmp_root` must
+be **node-local** (it holds shuffle buckets). `compute.num_gpus` is per node.
+
+**Three roles, in order.**
+
+```bash
+# 1. ONCE, on one node. Downloads the model and the six datasets, shards them, and stops.
+bash scripts/run_all.sh --prepare-only
+
+# 2. On EVERY node, at the same time. Generates; does not postprocess or upload.
+#    Each node works the 12 jobs in the same order and claims whatever is free.
+bash scripts/run_all.sh --generate-only
+
+# 3. ONCE, on one node, AFTER every node in step 2 has exited.
+bash scripts/run_all.sh --postprocess-only
+```
+
+Step 2 is safe to start on all nodes simultaneously — if you skip step 1 they serialise on
+a per-arm sharding lock rather than racing — but doing step 1 first is cleaner and lets you
+see the row counts before committing the fleet.
+
+**Why step 3 must be one node.** Two nodes shuffling the same job would share both an
+output directory and a bucket temp directory, and the shuffle unlinks buckets as it
+consumes them. That is real corruption, not duplicated work. Trim is idempotent and merely
+wasteful if doubled; shuffle is not.
+
+**Monitoring.** `bash scripts/run_all.sh --status` works from any node at any time. Per
+worker progress is at `log_root/<arm>/<prompt>/progress_<hostname>_w<N>.json` — the
+hostname is in the filename precisely so twelve nodes' worker 0 do not overwrite each
+other.
+
+**If a node dies mid-run**, do nothing special. Its in-flight shards are claimed but no
+longer heartbeated, and after `compute.claim_stale_after_s` (default 30 min) another node
+takes them over automatically. To hurry it along, re-run step 2 on any node.
+
+**One thing that is genuinely unsafe:** `--reap-claims --force`. It clears every claim
+regardless of liveness, which on a live multi-node run means two nodes generating the same
+shard. Use it only when nothing is running anywhere. Plain `--reap-claims` is safe at any
+time; it only removes claims that have gone quiet.
 
 ## 4. Stop and ask Tianjian
 
@@ -241,6 +296,10 @@ Agent: **do not decide these yourself.** Stop, ask, and wait.
 | **`no exact sm_XXX kernels ... will PTX-JIT`** | Your card runs, but through JIT-compiled PTX rather than tuned kernels. | Not an error. Expect a slow first few minutes while it compiles, then normal speed. Watch the first job's `tok/s`; if it stays far below the other cards, tell Wytro. |
 | **One GPU finishes long before the others** | Heterogeneous fleet with `shard_assignment: static`. | Set `shard_assignment: dynamic` in `cluster.yaml` and re-run. Safe at any point — it only changes which worker takes which shard, never what is generated. Finished shards are skipped. |
 | **A shard is stuck; no worker picks it up** | A `part_NNNNN.claim` directory left by a run that was killed. | The launcher clears these automatically on every start, so just re-run `03_run_job.sh`. To do it by hand: `python -m rewrite.run_rewrite --arm A --prompt-id pN --reap-claims`. **Never run that while workers are live** — it would let two workers take the same shard. |
+| **`only N shards for M GPUs`** at data prep | `sharding.shard_target_rows` is too large for your GPU count. At 100 GPUs the previous default of 10,000 rows failed this for most arms. | The error computes the value to use. Set it in `configs/data.yaml`, delete that arm's shard directory, re-run. **Do this before job 1** — shard size feeds the manifest fingerprint, so changing it later invalidates every `.done` marker. |
+| **`dataset has NO 'doc_id' column`** | An input dataset does not carry the join key. | Ask Wytro to add a `doc_id` column and re-upload; it costs nothing at upload time and makes the key durable. Only if that is impossible, set `sharding.require_doc_id: false` — the pipeline then synthesizes a row index, which works but ties the join to `data_root/shards/` surviving forever. |
+| **A shard seems stuck, owned by a node that died** | Its claim is no longer heartbeated. | Wait: another node takes it over after `claim_stale_after_s` (30 min). To hurry it, re-run the job on any node. Do **not** use `--reap-claims --force` while other nodes are working. |
+| **Two nodes both say "already running"** | The per-node lock doing its job — one launch per node per job. | Correct behaviour. Different nodes running the same job concurrently is how multi-node works; the same node twice is not. |
 | **Everything is slow** | Usually `tmp_root` on a network filesystem, or `cpu_workers` set too low for the trim stage. | Both are safe to change — they affect speed only, never output. |
 
 ---
@@ -276,11 +335,19 @@ A hard list. Each item exists because doing it silently invalidates the experime
 9. **Do not delete `data_root/shards/` when the run finishes.** Output rows carry `doc_id`,
    which is the key for joining back to the input corpus (topic labels, quality scores, and
    so on) if that is ever needed downstream. Ask Wytro before reclaiming that space.
-10. **Do not parallelise jobs to save time.** Each job already uses every GPU. Two at once
+10. **Do not run `--postprocess-only` on more than one node.** Two shuffles sharing a
+    bucket directory corrupt each other's output. Generation fans out; postprocess does not.
+11. **Do not use `--reap-claims --force` while anything is running**, anywhere. It clears
+    live claims and two nodes will then generate the same shards. Plain `--reap-claims` is
+    safe at any time.
+12. **Do not change `sharding.shard_target_rows` after job 1 has started.** It feeds the
+    manifest fingerprint; changing it renumbers `doc_id` and invalidates every `.done`
+    marker, i.e. throws the run away.
+13. **Do not parallelise jobs to save time.** Each job already uses every GPU. Two at once
    means two engines each trying to reserve 85% of the same card. The `flock` in
    `03_run_job.sh` prevents it — do not remove it.
-11. **Do not delete output to free space** without asking. A missing shard breaks row
+14. **Do not delete output to free space** without asking. A missing shard breaks row
    conservation, and at this scale regenerating one is hours of GPU time.
-12. **Do not commit `.env`, a token, model weights, or data.** `.gitignore` covers all of
+15. **Do not commit `.env`, a token, model weights, or data.** `.gitignore` covers all of
    them; keep it that way.
-13. **Do not lower `gpu_memory_utilization` to dodge an OOM.** See §5, row 1.
+16. **Do not lower `gpu_memory_utilization` to dodge an OOM.** See §5, row 1.

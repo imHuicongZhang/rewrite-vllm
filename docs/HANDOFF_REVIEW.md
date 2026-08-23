@@ -798,3 +798,281 @@ in minutes, and both refuse to let anyone "fix" a gap by installing a different 
 
 Everything else the review asserted about the code was accurate, and the four items it
 endorsed under §C3 are unchanged.
+
+---
+---
+
+# Addendum — 2026-08-23 (later): round 3, scaling to ~100 GPUs
+
+New information: Tianjian may have **on the order of 100 B300s** — roughly a dozen nodes,
+where the repo was built for one. Everything above remains the record.
+
+Headline: **§2 would have stopped the run before it started**, and **§1.1 was a real
+silent-corruption hazard**. Both are fixed. §6 turned out to be a non-problem, and I say so
+rather than inventing work.
+
+---
+
+## §1 Multi-node
+
+### 1.1 The reap hazard — **CONFIRMED, and worse than reported**
+
+The reading is right, and understated. `reap_stale_claims` did not merely reap
+optimistically — it removed **every** claim it found, unconditionally. The function even
+computed whether the shard was finished and then discarded the answer:
+
+```python
+finished = [p for p in d.glob(f"part_{si:05d}.done")]
+if finished:
+    pass                      # dead branch: computed, never used
+try: cp.rmdir()               # ... removes it either way
+```
+
+So on twelve nodes: node 2's launcher wipes node 1's live claims, node 2's workers claim
+shards node 1 is mid-generation on, both write, and because each shard is written
+atomically with last-writer-wins, **row conservation still passes**. Duplicated GPU-hours
+and a nondeterministic choice of surviving output, entirely silent. At ~100 GPUs and a
+two-week run that is an expensive failure to not detect.
+
+**What I built: heartbeat + age-based reaping, measured on the filesystem's own clock.**
+
+* A worker holds a `ClaimHeartbeat` for the duration of each shard — a daemon thread
+  touching the claim's mtime every 60s. The main thread is blocked inside `llm.generate()`
+  for minutes at a time, so a background tick is the only way to expose liveness at all.
+* `reap_stale_claims(stale_after_s=1800)` removes a claim only if it has gone that long
+  without a heartbeat (a 30× margin over the tick), or if its shard already has a `.done`
+  and the claim is simply litter — the dead branch above, now doing its job.
+* Claim ages are compared against `fs_now()`, which stamps a probe file on the same
+  filesystem and reads its mtime back, rather than against local `time.time()`. mtimes are
+  written by whichever node owns the claim; comparing them to a local clock would put the
+  whole scheme at the mercy of inter-node skew, which is exactly the sort of thing that
+  silently makes a live claim look stale.
+* Workers can now **take over** a demonstrably stale claim mid-run, so a node dying no
+  longer strands its in-flight shards until someone notices. The takeover goes through the
+  same atomic `try_claim`, so only one of many contenders wins.
+* `--reap-claims --force` preserves the old semantics for an operator who knows nothing is
+  running. The launcher never uses it.
+
+The launcher's reap is now safe while other nodes are working, which is the property the
+review asked for: safe **by construction**, not by instruction.
+
+**What I rejected, and why.**
+
+* *A one-time coordinator step separate from the per-node launcher.* Correct only if the
+  operator gets the sequencing right every time, and the failure mode is silent — the same
+  class of problem as the bug. It also does nothing for a node that dies mid-run.
+* *Liveness by recorded host and pid.* Works only same-node: you cannot check a pid on
+  another host without a login. It would have failed precisely in the multi-node case that
+  motivated the fix.
+* *No-op if any claim is younger than some interval.* A single fresh claim anywhere would
+  block reaping every genuinely dead one. Per-claim age is the same idea done at the right
+  granularity.
+
+Verified: a live claim survives a reap launched from another node; an hour-old orphan is
+reaped; a finished shard's claim is reaped as litter; a heartbeat rescues a claim that was
+about to look stale; 12 simulated nodes race for one shard and exactly one wins.
+
+### 1.2 Job lock — **fixed, moved off the shared filesystem**
+
+The lock exists to stop two engines landing on one GPU, which is per-node. It was at
+`$OUT_ROOT/raw/<arm>/<prompt>/.joblock`, so on a shared mount it would either block every
+node after the first or behave according to whatever `flock` semantics that mount happens
+to implement. Agreed that is not something to bet a two-week run on.
+
+Now `${TMPDIR:-/tmp}/rewrite-vllm.<hostname>.<arm>.<prompt>.lock` — node-local storage for
+reliable semantics, and the hostname in the filename so that a *shared* `TMPDIR` cannot
+quietly re-create the problem. The failure message says explicitly that the lock is
+per-node and that other nodes running the same job concurrently is how multi-node works,
+so the loud case does not read as an error when it is correct behaviour.
+
+### 1.3 Worker ID collisions — **fixed**
+
+`progress_{worker_id}.json` → `progress_{hostname}_w{worker_id}.json`, and `host` is now
+recorded in every `.done` sidecar alongside `gpu_name`/`gpu_cc`. Agreed on the reasoning:
+at this scale progress reporting is how anyone knows whether a week-long run is healthy.
+
+### 1.4 Orchestration roles — the part the review did not ask for but the fan-out needs
+
+`run_all.sh` runs preflight → model → data → 12 jobs → postprocess → upload. Run
+unmodified on twelve nodes, generation would fan out correctly (claiming handles it) but
+**postprocess would not**: two nodes shuffling the same job share an output directory *and*
+a bucket temp directory, and `bucketed_shuffle` unlinks buckets as it consumes them. That
+is corruption, not duplicated work. Trim is idempotent and merely wasteful; shuffle is not.
+
+Added three roles — `--prepare-only`, `--generate-only`, `--postprocess-only` — plus a
+per-arm sharding lock so that nodes reaching a fresh `data_root` together serialise instead
+of racing (losers wait for the manifest via `--wait-only`). Documented as §3.5 of the
+guide. No scheduler, no new framework, no change to the claiming logic.
+
+**On the SLURM question:** I do not think multi-node needs it. Claiming already provides
+the coordination, and `scripts/optional/slurm_job.sbatch` stays optional and unsupported —
+it now simply `exec`s the same bash path, so if he does submit it, each allocation behaves
+as one node. Making it "real" would mean owning a second launch path for no capability the
+bash one lacks.
+
+---
+
+## §2 Shard sizing — **the guard would have fired; the run could not have started**
+
+Computed against the source run's real per-arm document counts, at the shipped default of
+10,000 rows/shard and `min_shards_per_gpu: 20`:
+
+| arm | docs | shards @10k | needs at 100 GPUs | |
+|---|---:|---:|---:|---|
+| quality-first | 6,136,187 | 614 | 2,000 | **REFUSES** |
+| diversity-oriented | 5,876,747 | 588 | 2,000 | **REFUSES** |
+| disagreement-aware | 5,602,476 | 561 | 2,000 | **REFUSES** |
+| wrap-inspired | 10,604,458 | 1,061 | 2,000 | **REFUSES** |
+| rewire-inspired | 21,214,299 | 2,122 | 2,000 | passes |
+
+**Four of five arms refuse to start.** Not a tuning issue — a hard blocker on day one.
+
+Re-derived for ~100 workers rather than scaled from the 8-worker rationale:
+
+| rows/shard | shard @8k tok/s | tail idle over 12 jobs | shards, smallest arm | 20:1 at 100 GPUs |
+|---:|---:|---:|---:|:--:|
+| 10,000 | 11.5 min | 2.3 GPU-h | 561 | no |
+| 5,000 | 5.7 min | 1.1 GPU-h | 1,121 | no |
+| **2,000** | **2.3 min** | **0.5 GPU-h** | **2,802** | **yes, 28:1** |
+| 1,000 | 1.1 min | 0.2 GPU-h | 5,603 | yes, but 2× the files |
+
+**Changed the default to 2,000.** It clears the guard for every arm at 100 GPUs with the
+same 28:1 headroom the source ran at, keeps the tail to a couple of minutes, and still
+hands vLLM a batch well above its default `max_num_seqs`. Total output files across all 12
+jobs: ~60k shards plus sidecars, which is unremarkable. At 8 GPUs it is equally fine, so
+there is one default rather than two.
+
+**Should shard size be derived from GPU count? No — and this is worth being explicit
+about.** `num_gpus` lives in `cluster.yaml`, which is Tianjian's file, while shard size
+feeds the manifest fingerprint. Deriving one from the other would let a machine setting
+silently renumber `doc_id` and invalidate every `.done` marker. It stays an explicit value
+in `data.yaml` with the sizing table in a comment, decided before job 1, and the guard's
+error message now does the arithmetic and prints the value to set rather than leaving it to
+be discovered. Both the config and the guide say in terms that it must be fixed before
+job 1.
+
+---
+
+## §3 Requiring `doc_id` — **agreed, and made a hard failure by default**
+
+**Recommendation to Wytro: add an explicit `doc_id` column to all six datasets before
+pushing them.** It costs nothing at upload, and it makes the join key durable and
+independent of this pipeline's sharding — which is strictly better than the guide warning
+people not to delete a directory.
+
+Argued both ways, and I came down on hard failure:
+
+*For a warning:* the fallback is deterministic and reproducible, so a hard failure blocks a
+run over something that is not a safety issue.
+
+*For a failure, which is what I implemented:* the cost of complying is a single column at
+upload time; the cost of not noticing is discovering in six months that a join you assumed
+was possible depends on a scratch directory nobody was told to preserve. A warning at
+download time, during a step that prints thousands of lines and runs for hours, is not a
+control. And the escape hatch is one line.
+
+So `sharding.require_doc_id: true` is the default and absence is a hard stop naming the
+consequence and the fix; setting it `false` accepts the synthesized index. Either way the
+choice is recorded per arm in the manifest as `doc_id_source: "dataset" | "synthesized"`,
+surfaced in the summary line, and carried into `manifests/data_manifest.json` — so the
+decision is auditable rather than remembered.
+
+---
+
+## §4 Throughput calibration — **added**
+
+Agreed the per-shard `tok/s` logging is not sufficient, and specifically for the reason
+that it reports a rate but never a **projection**. Nothing in the repo turned a rate into
+"this run will take N days", which is the number that decides whether to keep going.
+
+`scripts/06_calibrate.py`, run by `run_all.sh` after preflight and before job 1. It prints
+per-job and total projected wall clock computed from the **actual manifest row counts**,
+plus a sensitivity band at half and double the measured rate, because the projection is
+only ever as good as one measured number.
+
+Two sources, and the second is better once it exists:
+
+* `--measure` — one shard-sized batch on one GPU with the real model, real prompt and real
+  documents.
+* `--from-sidecars` — derives the rate from shards already generated. Free, and far more
+  representative than a single batch because it is the actual run across the actual fleet.
+  It picks this automatically once ≥5 shards exist, so re-running it on day two gives a
+  much better number than day zero.
+
+It exits 0 even when it cannot measure: advisory, not a gate. I did not want a throughput
+estimate to be able to block a correct run.
+
+---
+
+## §5 Wrap selection caveat — **moved to where the data goes**
+
+Agreed the reasoning was stranded in a review document. It now lives in two places a future
+reader will actually meet:
+
+* **`configs/data.yaml`**, as a block immediately above the `wrap-inspired` arm, with the
+  worked numbers and the recommendation.
+* **The uploaded dataset cards.** `05_upload_to_hf.py` now writes a `README.md` into every
+  Hub repo describing the arm, the prompt, the locked generation settings, the column
+  semantics, and — for `wrap-inspired` only — the full selection caveat.
+
+The card matters more than the config, because the person who decides how to subsample this
+arm to 10B tokens may be neither of us and may never see this repository. The caveat has to
+travel with the data.
+
+Every card also states that `n_output_tokens_llama2` is the column to budget on and that
+`status == 2` is the filter for training use — two things easy to get wrong from the
+outside.
+
+---
+
+## §6 Is data prep a bottleneck? — **No. Measured, and documented rather than fixed.**
+
+Benchmarked the actual `shard_arm` pipeline on real documents, single process:
+
+```
+utf-8 encode only                    5,790 MB/s
+sha1 (encode + hash + hexdigest)     1,039 MB/s
+build arrow table                    3,219 MB/s
+parquet write                          263 MB/s
+FULL shard pipeline                    190 MB/s   <- the number that matters
+```
+
+At ~4.92 chars/token (measured on real source documents), Wytro's stated ~500B input
+tokens is ≈2,460 GB of text:
+
+| | wall clock |
+|---|---|
+| serial sharding, 1 process | **~3.6 h** |
+| across 8 processes | ~0.4 h |
+
+**Hours, not days**, so I have not parallelised it. Parquet write dominates at 263 MB/s and
+would be the thing to attack if it ever mattered, but adding multiprocessing to a
+correctness-critical path that fingerprints its own output, to save three hours of a
+multi-day run, is a bad trade.
+
+Two honest caveats: this excludes the HF **download**, which is network-bound and may well
+be the larger term, and it excludes `datasets` iteration overhead, so 4–8 h end to end is a
+fairer expectation than 3.6. Both are in the guide so the wait is expected rather than
+alarming, and `--prepare-only` exists so it can be done once, ahead of the fleet, rather
+than with 100 B300s idling.
+
+---
+
+## What the review got wrong
+
+Very little, and only in degree.
+
+1. **§1.1 was understated.** Reaping was not merely unsafe under concurrency — it was
+   unconditional, with a computed-then-discarded check that made it look safer than it was.
+2. **§1.2's "either blocks every node or behaves inconsistently"** is right, and there is a
+   third case worth naming: on a filesystem where `flock` silently no-ops, it would have
+   appeared to work while protecting nothing.
+3. **§2 understates the severity.** This was not "the guard would fire" as a tuning
+   annoyance — four of five arms could not have started, and the message did not say what
+   to set.
+4. **§6's framing** assumed serial sharding might be days. It is hours; the review was right
+   to ask for the number rather than assume.
+
+Everything else — that the generation core is already multi-node safe, that `os.mkdir` is
+the right primitive, that `worker_id` does not determine which shards get processed, that
+shard size interacts with the fingerprint and must be fixed before job 1 — was accurate.

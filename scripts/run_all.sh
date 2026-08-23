@@ -21,6 +21,7 @@ cd "$REPO_ROOT"
 
 # --- ARGPARSE BEGIN (tests/test_integration.py extracts between these markers) ---
 STATUS_ONLY=0; SKIP_UPLOAD=0; SKIP_PREFLIGHT=0; FROM_JOB=1
+DO_PREPARE=1; DO_GENERATE=1; DO_POST=1; SKIP_CALIBRATION=0
 
 usage() {
   sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -39,6 +40,12 @@ while [[ $# -gt 0 ]]; do
     --skip-upload)    SKIP_UPLOAD=1 ;;
     --skip-preflight) SKIP_PREFLIGHT=1 ;;
     --from-job=*)     FROM_JOB="${1#*=}" ;;
+    # --- multi-node roles. On one node: --prepare-only, then --postprocess-only at the
+    # --- end. On every node in between: --generate-only. See GUIDE section 3.
+    --prepare-only)     DO_GENERATE=0; DO_POST=0 ;;
+    --generate-only)    DO_PREPARE=0; DO_POST=0 ;;
+    --postprocess-only) DO_PREPARE=0; DO_GENERATE=0; SKIP_PREFLIGHT=1 ;;
+    --skip-calibration) SKIP_CALIBRATION=1 ;;
     --from-job)
       shift
       [[ $# -gt 0 ]] || { echo "*** STOP: --from-job needs a job number." >&2; exit 2; }
@@ -47,7 +54,9 @@ while [[ $# -gt 0 ]]; do
     # Unknown options used to be ignored, which is how a misparsed value slipped through
     # unnoticed. Refuse instead.
     *) echo "*** STOP: unknown option: $1" >&2
-       echo "    valid: --status --skip-upload --skip-preflight --from-job N|--from-job=N" >&2
+       echo "    valid: --status --skip-upload --skip-preflight --skip-calibration" >&2
+       echo "           --from-job N|--from-job=N" >&2
+       echo "           --prepare-only --generate-only --postprocess-only" >&2
        exit 2 ;;
   esac
   shift
@@ -130,14 +139,35 @@ else
 fi
 
 # ---- 1. model ----------------------------------------------------------------------
+# Always: every node needs local weights, and it is idempotent.
 echo; echo "### model"
 python -u scripts/01_download_model.py --config-root "$REPO_ROOT"
 
 # ---- 2. data -----------------------------------------------------------------------
-echo; echo "### data (all six arms; quality-base is verified but never rewritten)"
-python -u scripts/02_download_data.py --config-root "$REPO_ROOT"
+# Sharding is per-arm lock-protected, so running this on several nodes at once is safe --
+# the losers wait for the manifest rather than duplicating the work. On a multi-node run
+# it is still cleaner to do it once with --prepare-only before fanning out.
+if [[ "$DO_PREPARE" == "1" ]]; then
+  echo; echo "### data (all six arms; quality-base is verified but never rewritten)"
+  python -u scripts/02_download_data.py --config-root "$REPO_ROOT"
+else
+  echo; echo "### data: skipped (not this node's role); waiting for manifests"
+  python -u scripts/02_download_data.py --config-root "$REPO_ROOT" --wait-only
+fi
+
+# ---- 2b. calibration: measure real throughput before committing days to this --------
+if [[ "$DO_GENERATE" == "1" && "$SKIP_CALIBRATION" == "0" ]]; then
+  echo; echo "### calibration"
+  python -u scripts/06_calibrate.py --config-root "$REPO_ROOT" || \
+    echo "  (calibration failed; continuing -- it is advisory, not a gate)"
+fi
+
+if [[ "$DO_GENERATE" != "1" ]]; then
+  echo; echo "### generation: skipped (not this node's role)"
+fi
 
 # ---- 3. the 12 jobs, strictly sequentially -----------------------------------------
+if [[ "$DO_GENERATE" == "1" ]]; then
 echo; echo "### job table BEFORE"
 table
 
@@ -168,8 +198,14 @@ for spec in "${JOBS[@]}"; do
   echo "=== [$idx/${#JOBS[@]}] $ARM/$PID  $(date -Is) ==="
   bash scripts/03_run_job.sh "$ARM" "$PID"
 done
+fi   # DO_GENERATE
 
 # ---- 4. postprocess: trim then shuffle, per job -------------------------------------
+# ONE node only. Two nodes shuffling the same job would share an output dir AND a bucket
+# temp dir, and bucketed_shuffle unlinks buckets as it consumes them -- that is real
+# corruption, not just wasted work. On a multi-node run use --postprocess-only, on one
+# node, after every node has finished generating.
+if [[ "$DO_POST" == "1" ]]; then
 echo; echo "### postprocess (trim -> shuffle, within (arm, prompt) only)"
 python -u scripts/04_postprocess.py --config-root "$REPO_ROOT"
 
@@ -180,6 +216,9 @@ if [[ "$SKIP_UPLOAD" == "0" ]]; then
 else
   echo; echo "### upload SKIPPED (--skip-upload)"
 fi
+else
+  echo; echo "### postprocess + upload: skipped (not this node's role)"
+fi   # DO_POST
 
 echo; echo "### job table AFTER"
 table

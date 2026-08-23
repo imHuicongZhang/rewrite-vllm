@@ -59,6 +59,12 @@ compute:
   # WHICH worker does which shard.
   shard_assignment: dynamic
 
+  # How long a shard claim may go without a heartbeat before another worker may take it
+  # over. Workers heartbeat every 60s while generating, so the default is a 30x margin.
+  # Only relevant on multi-node runs and after a worker dies mid-shard; leave it alone
+  # unless a single shard could plausibly take longer than this to generate.
+  claim_stale_after_s: 1800
+
   # Usable RAM in BYTES for the shuffle. Internally capped at 256 GiB regardless.
   # how to find:  free -b | awk '/^Mem:/{print $2}'   then take ~70% of that
   shuffle_mem_bytes: "<<<TIANJIAN: usable RAM in bytes, e.g. 274877906944 for 256GiB>>>"

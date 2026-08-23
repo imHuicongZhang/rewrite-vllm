@@ -69,9 +69,12 @@ def fake_open_dataset(cfg, a, streaming=False):
             texts.append("LONG " * 30000)        # ~37.5k fake tokens > both drop thresholds
         else:
             texts.append(f"[{a.name}] doc {i}. " + "content word " * rnd.randint(3, 40))
-    tbl = pa.table({"text": pa.array(texts, type=pa.large_string())})
+    cols = {"text": pa.array(texts, type=pa.large_string())}
+    if not getattr(fake_open_dataset, "omit_doc_id", False):
+        # real datasets are required to carry doc_id (configs/data.yaml require_doc_id)
+        cols["doc_id"] = pa.array(range(n), type=pa.int64())
     from datasets import Dataset
-    return Dataset(tbl)
+    return Dataset(pa.table(cols))
 D._open_dataset = fake_open_dataset
 D.download_arm = lambda cfg, arm, log=print: log(f"[data] {arm}: (stub) download skipped")
 
@@ -178,7 +181,9 @@ E.run_batch = slow_run_batch
 _shard_owner = {}
 _orig_write_sidecar = D.write_sidecar
 def tracking_write_sidecar(out_path, payload):
-    _shard_owner.setdefault(payload["job_id"], {})[payload["shard_index"]] = payload["worker_id"]
+    if "job_id" in payload and "worker_id" in payload:      # real worker sidecars only
+        _shard_owner.setdefault(payload["job_id"], {})[payload["shard_index"]] = \
+            payload["worker_id"]
     return _orig_write_sidecar(out_path, payload)
 D.write_sidecar = tracking_write_sidecar
 
@@ -345,8 +350,14 @@ D.try_claim(jd2.output_dir, si2, {"worker_id": 99, "pid": -1, "host": "dead-node
 RR.run_worker(cfg, jd2, 0, NGPU)
 expect(not D.sidecar_path(jd2.output_dir / f"part_{si2:05d}{cfg.shard_suffix}").exists(),
        f"a live claim BLOCKS another worker from redoing shard {si2}")
-n = D.reap_stale_claims(jd2.output_dir, log=lambda m: None)
-expect(n >= 1, f"reap_stale_claims removed the dead run's claim ({n})")
+# Reaping is age-based now, so a FRESH claim must survive -- that is what makes a reap
+# from another node safe. Backdate it to simulate the owner having died.
+n = D.reap_stale_claims(jd2.output_dir, stale_after_s=1800, log=lambda m: None)
+expect(n == 0, "a fresh claim survives a reap (this is the multi-node safety property)")
+import os as _os2, time as _t2
+_os2.utime(D.claim_path(jd2.output_dir, si2), (_t2.time() - 7200,) * 2)
+n = D.reap_stale_claims(jd2.output_dir, stale_after_s=1800, log=lambda m: None)
+expect(n >= 1, f"once stale, the dead run's claim IS reaped ({n})")
 RR.run_worker(cfg, jd2, 0, NGPU)
 expect(D.sidecar_path(jd2.output_dir / f"part_{si2:05d}{cfg.shard_suffix}").exists(),
        "after reaping, the shard is picked up and completed")
@@ -448,6 +459,95 @@ for form in (["--bogus"], ["--from-job"], ["--from-job", "abc"], ["--from-job", 
     badok &= hit
     if not hit: print(f"       {' '.join(form)} -> rc={rc} {out} (should be rejected)")
 expect(badok, "A4: malformed and unknown options are REJECTED, not silently ignored")
+
+# ================================================================= 10. multi-node safety
+hdr("10. multi-node safety (round 3)")
+import os as _os, time as _time
+mn = Path(tempfile.mkdtemp())
+
+# A reap run from another NODE must not touch claims a live worker is holding.
+D.try_claim(mn, 1, {"worker_id": 0, "pid": 111, "host": "node01"})   # live
+D.try_claim(mn, 3, {"worker_id": 0, "pid": 999, "host": "dead"})     # orphan
+_os.utime(D.claim_path(mn, 3), (_time.time() - 3600,) * 2)
+D.try_claim(mn, 4, {"worker_id": 2, "pid": 113, "host": "node01"})   # litter
+D.write_sidecar(mn / "part_00004.jsonl.zst", {"shard_index": 4, "n_rows_out": 1})
+reaped = D.reap_stale_claims(mn, stale_after_s=1800, log=lambda m: None)
+expect(D.claim_path(mn, 1).exists(),
+       "1.1: a LIVE claim survives a reap launched from another node")
+expect(not D.claim_path(mn, 3).exists(), "1.1: an orphaned claim IS reaped")
+expect(not D.claim_path(mn, 4).exists(), "1.1: a finished shard's claim is reaped as litter")
+expect(reaped == 2, f"1.1: exactly the dead ones went ({reaped})")
+
+# heartbeat keeps a long-running shard's claim alive
+D.try_claim(mn, 6, {"worker_id": 0, "pid": 115, "host": "node01"})
+_os.utime(D.claim_path(mn, 6), (_time.time() - 3600,) * 2)
+with D.ClaimHeartbeat(mn, 6, interval=0.2):
+    _time.sleep(0.6)
+    age = D.claim_age_s(mn, 6)
+expect(age < 5, f"1.1: ClaimHeartbeat refreshes a claim mid-shard ({age:.1f}s old)")
+D.reap_stale_claims(mn, stale_after_s=1800, log=lambda m: None)
+expect(D.claim_path(mn, 6).exists(), "1.1: and it then survives a reap")
+
+# --force is still available for "nothing is running anywhere"
+D.reap_stale_claims(mn, force=True, log=lambda m: None)
+expect(not any(mn.glob("part_*.claim")), "1.1: --force still clears everything")
+
+# only one of many nodes can hold a shard
+got = [D.try_claim(mn, 9, {"worker_id": i, "pid": i, "host": f"node{i:02d}"})
+       for i in range(12)]
+expect(sum(got) == 1, f"1.1: 12 nodes race for one shard, exactly {sum(got)} wins")
+shutil.rmtree(mn, ignore_errors=True)
+
+# 1.2: the job lock is node-local, so other nodes are not blocked
+rj = (REPO / "scripts" / "03_run_job.sh").read_text()
+expect("${TMPDIR:-/tmp}" in rj and "$(hostname -s)" in rj,
+       "1.2: the job lock lives on node-local storage and is keyed by hostname")
+expect('LOCK="$LOCK_DIR/.joblock"' not in rj,
+       "1.2: the old shared-filesystem lock is gone")
+
+# 1.3: progress files cannot collide across nodes
+expect("progress_{HOST}_w{worker_id}.json" in (REPO / "src" / "rewrite" / "run_rewrite.py").read_text(),
+       "1.3: progress filenames are node-qualified")
+
+# §2: the shard guard's arithmetic, and that the shipped default clears it at 100 GPUs
+# read the SHIPPED config, not the tiny override this test uses for its toy corpus
+_shipped = yaml.safe_load((REPO / "configs" / "data.yaml").read_text())["sharding"]
+rows_per_shard = _shipped["shard_target_rows"]
+min_ratio = _shipped["min_shards_per_gpu"]
+expect(rows_per_shard == 2000,
+       f"2: shipped shard_target_rows is sized for ~100 GPUs ({rows_per_shard})")
+for arm_docs, label in ((5_602_476, "smallest source arm"),):
+    shards = -(-arm_docs // rows_per_shard)
+    expect(shards >= min_ratio * 100,
+           f"2: {label} gives {shards:,} shards >= {min_ratio*100:,} needed at 100 GPUs")
+    expect(-(-arm_docs // 10_000) < min_ratio * 100,
+           f"2: the OLD default of 10,000 rows would have refused to start at 100 GPUs")
+
+# §3: doc_id provenance is recorded per arm, and the requirement is enforced
+for a in ARMS:
+    expect(D.load_manifest(cfg, a).doc_id_source == "dataset",
+           f"3: {a} manifest records doc_id_source=dataset")
+import copy as _copy
+_tmpcfg = _copy.deepcopy(cfg)
+_tmpcfg.paths = dict(cfg.paths)
+_tmpcfg.paths["data_root"] = WORK / "nodocid"
+fake_open_dataset.omit_doc_id = True
+try:
+    D.shard_arm(_tmpcfg, "quality-first", log=lambda m: None)
+    hard_failed = False
+except SystemExit:
+    hard_failed = True
+expect(hard_failed, "3: a dataset with NO doc_id is REJECTED when require_doc_id is true")
+_tmpcfg.data = _copy.deepcopy(cfg.data)
+_tmpcfg.data["sharding"]["require_doc_id"] = False
+_tmpcfg.paths["data_root"] = WORK / "nodocid2"
+try:
+    m2 = D.shard_arm(_tmpcfg, "quality-first", log=lambda m: None)
+    ok2 = m2.doc_id_source == "synthesized"
+except SystemExit:
+    ok2 = False
+expect(ok2, "3: require_doc_id: false accepts it and records doc_id_source=synthesized")
+fake_open_dataset.omit_doc_id = False
 
 # ================================================================= summary
 hdr("SUMMARY")
