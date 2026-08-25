@@ -38,10 +38,14 @@ Where they disagreed, the resolution is stated explicitly rather than silently p
 | 5 | what gets rewritten | the whole arm dataset | **the remainder only**; a shared 20B core stays raw | 3 |
 | 6 | arms in `data.yaml` | 6 (incl. `quality-base` control) | **5**, all rewritten | 3 |
 | 7 | data source | 6 independent flat HF repos | **1 gated repo**, 5 folders | 4 |
-| 8 | `est_output_tokens_per_arm` | `100e9` scalar × 5 = 500B | per-arm, measured; **261.5B** total | 5 |
+| 8 | `est_output_tokens_per_arm` | `100e9` scalar × 5 = 500B | per-arm, measured; **~260B ± 10%** total | 5 |
 | 9 | disk estimate | hardcoded "~2.4 TB / ~0.7 TB" | derived; **1.125 TiB / 0.338 TiB** | 5 |
 | 10 | `shard_target_rows` | 2000 | **5000** | 5 |
-| 11 | compression ratio | assumed | **measured per prompt** | 6 |
+| 11 | compression ratio | assumed | **measured per prompt** | 5 |
+| 12 | the 50B/arm invariant | never stated | stated, with produced-vs-needed per arm | 6 |
+| 13 | ReWire filter | "keep the top half" | **fixed-budget fill; 30.8% realized at 1.5B** | 10.1 |
+| 14 | `r` transfer across populations | not acknowledged | open question; estimate now **~260B ± 10%** | 10.3 |
+| 15 | prompt provenance | overhead fingerprint only | byte-compared vs originals; **1 difference open** | 9 |
 
 ---
 
@@ -151,6 +155,43 @@ stream is caught rather than silently re-rolling the corpus.
 > the source's. The assignment is reproducible **within this pipeline**; it is **not** the same
 > assignment the 1.5B run produced, and cannot be — different corpus, different sharding. What
 > is preserved is the *mechanism* and its statistical properties, not the specific draw.
+
+### The two overhead-verification paths — checked, both still correct
+
+The restructure moved four templates from four jobs into one, so both checks that were
+keyed to "one prompt per job" had to change. Both were changed, and all four wrap
+overheads are still asserted. Measured against the real Qwen2.5-7B-Instruct tokenizer:
+
+| template | measured | expected | |
+|---|---:|---:|---|
+| `p1_wiki` | 150 | 150 | ok |
+| `p2_distill` | 185 | 185 | ok |
+| `wrap_easy` | 72 | 72 | ok |
+| `wrap_hard` | 66 | 66 | ok |
+| `wrap_wiki` | 73 | 73 | ok |
+| `wrap_qa` | 83 | 83 | ok |
+
+**`expected_overhead` at runtime.** `PromptSpec.overheads()` returns one
+`(label, text, expected)` triple per prompt *text* the job can emit — one for a grounded
+job, **four** for the styled pass. `engine.check_overheads()` measures each;
+`run_rewrite.run_worker` fails the job if *any* mismatches and names which. The expected
+values live per style in `prompt_defs.wrap_styled.styles[*].expected_overhead`, so all four
+are config-visible rather than one standing in for four. The sidecar records a dict of the
+four rather than a single integer for that job.
+
+**`scripts/preflight.py` check 6.** Loops the same `overheads()` expansion and reports
+`n_texts` explicitly — 6 distinct texts across 10 jobs — so a silent collapse to one text
+per job would show up as a changed count.
+
+**`scripts/verify_prompt_parity.py`.** Runs standalone from the YAML without
+`config.py`'s loader, so it needed its own expansion: a `_units()` helper yields four
+entries for a `wrap_multi` def (reading `prompt_defs.<def>.styles`) and one otherwise. It
+prints every expected-vs-actual pair, and it independently re-checks the **style order**
+against `["easy","hard","wiki","qa"]`, since the order is part of the seed and this script
+is the one that runs without the loader's guard.
+
+**Net:** four values asserted where there were four before, in three independent places.
+Neither check silently narrowed to a single style.
 
 ### The subsampling caveat was written for the four-pass design — removed
 
@@ -462,6 +503,28 @@ that still holds: `num_gpus` lives in Tianjian's `cluster.yaml`, while shard siz
 manifest fingerprint. Deriving one from the other would let a machine-local setting silently
 renumber `doc_id`.
 
+### Prefill is ~73% of the tokens, and the calibration now says so
+
+720B input against ~260B output is **2.75:1**. Most rewriting workloads sit near 1:1, so
+prefill — not decode — dominates GPU time here, and a single blended tok/s hides that.
+`scripts/06_calibrate.py` now reports prompt tok/s and output tok/s separately, the measured
+mix, and whether that mix matches the 2.75:1 the config implies (flagging a >25% divergence,
+which would indicate the token estimates are wrong rather than the engine).
+
+**The regime is not new.** The originating 1.5B run had the same shape — its census counters
+give 192.6B input against 69.5B output, **2.77:1**, within 1% of ours — and it completed on
+the same engine version. So the inherited prefill settings have already been exercised at
+this ratio at scale.
+
+**Engine args unchanged, and the relevant ones were never ours to begin with.** The source
+never passed `max_num_batched_tokens` or `enable_chunked_prefill`; it inherited
+`max_num_batched_tokens=16384` / `enable_chunked_prefill=True` from vLLM's defaults, visible
+in its own logged config dump (`07_rewrite/logs/rw_*_*.out:6,9`) and already recorded in
+`configs/vllm.yaml` under `inherited_defaults_do_not_pass`. There is therefore no evidence
+of mistuning to report — the prefill path in this run is the one that produced the 1.5B
+corpus at 2.77:1. Guidance for Tianjian is in `GUIDE_FOR_TIANJIAN.md` §4.5, framed as
+"measure before concluding, and bring findings to Wytro", not as a config change.
+
 ### Calibration
 
 `scripts/06_calibrate.py` reads shard and row counts from the manifests, so it follows the new
@@ -470,15 +533,77 @@ counts automatically. Its per-job projection now takes `tok_per_doc` from the pe
 
 ---
 
-## 6. Which tokens go through the GPU — the short answer
+## 6. The 50B invariant, and did we generate enough?
+
+### Every arm lands at 50B training tokens
+
+This is the constraint the whole half+half structure exists to satisfy, and earlier
+revisions of this document never stated it.
+
+```
+quality-base   =  50B raw                          (top-50B prefix of the fastText order)
+every other arm =  20B raw core  +  30B rewritten   =  50B
+```
+
+Established, not inferred:
+
+- `select_600m.py:78-79` — `CORE_TARGET = 20_000_000_000`, `QBASE_TARGET = 50_000_000_000`.
+- `select_600m.py:358` — *"`quality-base` | `final_training` | the raw-text control. All 50B
+  is used as-is; **never rewritten**. This is what the model trains on."* So 50B is a
+  **final training** budget, and it is the only arm whose final budget is stated directly.
+- `02_select/README.md` — `quality-base` is the **top-50B prefix** of the same `ftq` order
+  whose top-20B prefix is the core; `verify_materialize.py:116-126` asserts that
+  `quality-base` therefore *contains* the core. So `quality-base` is already
+  `20B core + 30B next-best raw`.
+- For the arms to be comparable, every other arm must also reach 50B: its 20B core plus
+  **30B drawn from its rewritten output**.
+
+The 1.5B run confirms the pattern at half the ratio: `select_10b.py:48-51` has
+`SHARED_TARGET = 5B`, `QBASE_TARGET = 5B`, `TARGET = 10B`, and the postprocess mixed a 5B
+shared core with a 5B rewritten selection (`03_mix_shared_top*.py`;
+`_step2_wrap_summary.json` records `target: 5000000000`, `shortfall_vs_target: 0`). So
+10B = 5B + 5B there, and 50B = 20B + 30B here. The core's share dropped from 50% to 40%
+between scales; the *invariant* is the 50B total, not the split.
+
+The remainder budgets are **source** budgets and always over-produce; the surplus is
+trimmed to 30B. `select_600m.py:122`: *"Expect ~36B out of 60B and trim to budget, as at
+1.5B."*
+
+### Did we generate enough? — output produced vs output needed
+
+| arm | source | output produced | needed | ratio | headroom |
+|---|---:|---:|---:|---:|---:|
+| quality-first | 60B | 35.88B | 30B | 1.196× | **+19.6%** ← tightest |
+| diversity-oriented | 60B | 39.94B | 30B | 1.331× | +33.1% |
+| disagreement-aware | 60B | 38.40B | 30B | 1.280× | +28.0% |
+| wrap-inspired | 60B | 47.82B | 30B | 1.594× | +59.4% |
+| rewire-inspired | 120B | 99.46B | 30B | 3.315× | +231% |
+
+Every arm clears its budget, and **`quality-first` is the tightest at +19.6%**, not
+`rewire-inspired`.
+
+Each ratio is exactly `r_arm × source / 30B`, so it reproduces the 1.5B run's headroom
+*identically* — the budgets scaled 6× (10B→60B source, 5B→30B needed) and `r` was carried
+over, so the ratios cannot differ. Every one of these arms demonstrably filled its budget
+at 1.5B (`_step2_wrap_summary.json` `shortfall_vs_target: 0`;
+`_step4_rewrite_summary.json` `filled: true`). That is the strongest available evidence
+that they will fill again — and it is also exactly why §9's `r`-transfer caveat matters:
+the headroom column is only as good as `r`, and +19.6% is not a large margin.
+
+---
+
+## 6b. Which tokens go through the GPU — the short answer
 
 ```
 INPUT  to the GPU   720.0 B tokens  (360.0 B source × 2 passes)
-OUTPUT from the GPU 261.5 B tokens  (measured r, per prompt, per arm)
+OUTPUT from the GPU ~261   B tokens  (measured r, per prompt, per arm)
+KEPT for training    150   B tokens  (5 arms × 30B, after trimming to budget)
 
 NEVER touches a GPU  70.0 B tokens
     shared-core    20.0 B   raw, carried into training by all five arms
     quality-base   50.0 B   raw control, never uploaded, local only
+
+FINAL TRAINING MIX   50B per arm × 6 arms (incl. quality-base) = 300B
 ```
 
 `configs/data.yaml` now states this explicitly: each arm carries its `docs`,
@@ -496,11 +621,18 @@ the header comment. A reader can see the GPU/no-GPU split without opening a Pyth
 | B3 | `HF_TOKEN_WRITE` — write-scoped token for the output org | **Wytro** | upload only |
 | B4 | 11 blanks in `configs/cluster.yaml` + `HF_TOKEN` in `.env` | **Tianjian** | everything |
 | B5 | Hub card has no `configs:` block. Not required — the access layer uses explicit globs — but it makes the dataset usable by anyone else. Draft ready at `data_reports/DATASET_CARD_DRAFT.md`. | Wytro | nothing |
+| B6 | **`blab-jhu/KYS-Configs` is also `gated: manual`.** Its `prompts/` files 401 without access, so the four wrap templates could not be diffed against the originals and the distill discrepancy (§9) cannot be resolved. | **Wytro** | correctness of 5–10 of the 10 jobs, not startup |
+| B7 | **The distill template differs from the published original by one trailing newline** (§9). Same token count, different token IDs, used by 5 of 10 jobs. Not adopted in either direction pending B6. | **Wytro** to adjudicate | correctness, not startup |
 
-B1 is new this round and is the most likely day-zero failure, so **preflight now checks it
-directly**: it attempts an authenticated metadata read of the dataset and fails with an
-actionable message rather than letting the run die partway through step 2. No existing gate was
-weakened to smooth the one-button path.
+B1 remains the most likely day-zero failure, so **preflight checks it directly**: it fetches a
+real file rather than reading metadata, because listing a gated repo succeeds without access. No
+existing gate was weakened to smooth the one-button path.
+
+**B6/B7 are new this round and are of a different kind: they do not stop the run, they make it
+possible to run the wrong thing.** A corpus generated against a prompt that differs from the
+original by one token is not obviously broken and would not be noticed downstream — which is
+the failure this project has already been burned by once. They should be closed before job 1,
+not after.
 
 ### Placeholders resolved this round
 
@@ -584,16 +716,139 @@ Recorded here because the arithmetic route looked convincing and was not.
 
 ---
 
-## 9. Open questions
+## 9. Prompt provenance: byte comparison against the published originals — **1 DIFFERENCE, UNRESOLVED**
 
-1. **The ReWire top-half filter is not implemented.** `rewire-inspired` gets κ=2 (120B rather
-   than 60B) explicitly to buy headroom for a post-rewrite filter: score the *rewritten* text
-   with fastText and keep the top half. At 1.5B that was a separate stage —
-   `_step3_rewrite_summary.json` / `_step4_rewrite_summary.json`: 20.0B source → 16.22B
-   rewritten → cutoff 0.11456 → 5,000,000,351 tokens kept. **This repo has no such stage**, so
-   `rewire-inspired` will ship ~99.5B output tokens unfiltered.
-   *Owner: Wytro (downstream). Blocks the run: no. Blocks rewire's training mix: yes.*
-   Deliberately out of scope for round 4, which was a realignment.
+The authoritative prompt files were published at
+`https://huggingface.co/datasets/blab-jhu/KYS-Configs` (sha `d094c621…`). Four of this
+repo's six templates — the distill prompt and the four wrap styles — were **reconstructed**
+from logged chat-templated inputs rather than copied, so a direct byte comparison is
+decisive where the token-overhead fingerprint was only suggestive.
+
+**That repo is also `gated: manual`, and its `prompts/` files return 401 unauthenticated.**
+The comparison below therefore uses **git blob SHA-1 OIDs** from the Hub tree API, which are
+SHA-1 over the exact file bytes (`sha1("blob <len>\0" + content)`) and are published even
+when content is not. That is a byte-exact comparison, not a proxy.
+
+| template | ours (size / git-oid) | theirs (size / git-oid) | identical |
+|---|---|---|---|
+| wiki-grounded | 597 / `802aff3de60c17d2fd46840d5f89b924abb2601c` | 597 / `802aff3de60c17d2fd46840d5f89b924abb2601c` | **YES** |
+| distill | 842 / `200cd2c3f6782d9fcfada993054fbdf1a4091a57` | 841 / `38da40ce870e392ee23b8f27d9c61b3a358d3047` | **NO** |
+| wrap ×4 | 4 separate `.txt` | one `wrap_prompts.json`, 972 / `07930c8e…` | **INCONCLUSIVE** |
+
+md5, for the record: ours wiki `bca104fe6e298615e5ccb9c9c747073b`, distill
+`538700534e99d5e80b268fd9b2408b48`, wrap easy/hard/wiki/qa
+`0735f53a…` / `e99a613b…` / `cec46736…` / `733fbeea…`. Theirs cannot be md5'd without
+content access; the git OIDs above serve the same purpose and are what the comparison rests on.
+
+### The distill difference, exactly
+
+**Our copy has one extra trailing newline.** Proven rather than guessed: stripping a single
+trailing `\n` from our 842-byte file reproduces their OID `38da40ce…` exactly.
+
+```
+ours : b'... high-quality and clear English following the instructions.\n'   (842 B)
+orig : b'... high-quality and clear English following the instructions.'     (841 B)
+```
+
+**What it costs, measured against the real Qwen2.5-7B-Instruct tokenizer:**
+
+| | ours | original |
+|---|---:|---:|
+| empty-doc overhead | **185** | **185** |
+| templated token count, real doc | 200 | 200 |
+| token IDs identical | — | **no** |
+
+The overhead is **unchanged**, and so is the total token count. Exactly **one token
+differs**, at position 179: ours emits token `624` = `'.\n'` where the original emits token
+`13` = `'.'`, immediately before `<|im_end|>`.
+
+Two things follow, and they point in opposite directions:
+
+- **The difference is real and reaches the model.** A different token sequence at
+  `temperature=0` can produce different output. This template is used by **5 of the 10
+  jobs** — every arm's distill pass.
+- **The overhead fingerprint cannot see it.** 185 = 185. This is precisely the class of
+  difference the token count was blind to, which is the argument for doing the byte
+  comparison at all — and it is why the expected values must be re-derived from the
+  originals rather than from the reconstructions.
+
+> Note for anyone re-deriving: the premise that "a trailing newline shifts the overhead" is
+> **false for this tokenizer** — Qwen merges `.` + `\n` into a single token `'.\n'`, so the
+> count is preserved while the identity is not. Do not use an unchanged overhead as
+> evidence that a template is unchanged.
+
+### Status: stopped, nothing adopted
+
+Per instruction, **no prompt file and no `expected_overhead` was changed.** Adopting either
+side silently is the failure mode this check exists to prevent, and there are two open
+questions that only content access can settle:
+
+1. **Which side is authoritative for distill?** The published file is labelled the original,
+   but our reconstruction is what round 3 verified against 18,000 logged 1.5B distill rows.
+   If the 1.5B run itself used the trailing-newline form, the *published* file is the one
+   that drifted, and adopting it would break parity with the corpus we are trying to match.
+   The logged `templated_input` fields in `00_Prompts/generations/nemotron_distill_1.5B.jsonl`
+   can settle this directly — they contain the fully rendered prompt.
+2. **The four wrap templates are unverified.** Their originals live inside a single
+   `wrap_prompts.json` (972 B), and our four `.txt` files cannot be compared to it by OID.
+   18,432 candidate JSON serialisations of our four texts were tried — key order, indent,
+   separators, trailing newline, and per-template newline stripping — and **none** reproduces
+   `07930c8e…`. That is *inconclusive*, not a proof of difference: the original's exact
+   serialisation is simply unknown. Their four overheads do all match expectation (72/66/73/83),
+   which is weak positive evidence and, as the distill case just demonstrated, not conclusive.
+
+**To close this, Wytro needs to grant read access to `blab-jhu/KYS-Configs`.** Then the four
+wrap templates can be diffed directly and the distill question resolved against the logged
+1.5B inputs. Until then the overhead assertions stay as the runtime guard — they are correct
+as shipped (all six verified above) but, as established, they cannot detect this class of
+difference.
+
+---
+
+## 10. Open questions
+
+1. **The ReWire filter is not implemented — and it is a fixed-BUDGET cut, not "the top half".**
+
+   `rewire-inspired` gets κ=2 (120B rather than 60B) to buy headroom for a post-rewrite
+   filter: score the *rewritten* text with fastText, sort descending, and fill to the
+   arm's token budget. **This repo has no such stage**, so it will ship ~99.5B output
+   tokens unfiltered. *Owner: Wytro (downstream). Blocks the run: no. Blocks rewire's
+   training mix: yes.* Out of scope by decision; recorded here so whoever runs it has the
+   numbers.
+
+   **Two corrections to how this was previously written down.**
+
+   *(a) "Keep the top half" was wrong, in this document and in `configs/data.yaml`.* The
+   1.5B run kept **30.8%**, not 50%: `_step4_rewrite_summary.json` records
+   `pool_tokens 16,221,811,013 → kept_tokens 5,000,000,351`.
+
+   *(b) More importantly, it is not a fraction at all, and not a fixed threshold either.*
+   The same file states the mechanism outright:
+
+   > `pipeline`: "rewire-inspired: rewrite broadly → fasttext score rewritten → **keep top 5B**"
+   > `selection_note`: "…kept set is the **token-budget-matched top-5B (NOT the paper top-10%)**"
+   > `target: 5000000000`, `overshoot: 351`, `filled: true`
+
+   The score cutoff `0.1145634651184082` is the **output** of filling to a 5B target, not
+   an input to the filter. That distinction matters, because it removes the failure mode
+   the tightest reading of this suggested — that a fixed threshold might retain a smaller
+   fraction at this scale and leave the arm short. A budget-fill cannot come up short
+   while the pool exceeds the budget; what moves instead is the *cutoff score*, i.e. the
+   **quality** of the kept set.
+
+   **The headroom is not tight.** Required retention at 600M is `30B / 99.46B = 30.2%`,
+   against `30.8%` realized at 1.5B — the same, because κ=2 was sized precisely so the
+   pool-to-budget ratio carries over (3.32× here, 3.24× there). By §6's table
+   `rewire-inspired` has **+231% headroom, the roomiest of the five arms**; the tightest
+   is `quality-first` at +19.6%.
+
+   **Recommendation, not a decision:** implement it as a fixed-budget fill
+   (`fill_to(order_by_score_desc, tokens, 30e9)`), matching the 1.5B code path, rather
+   than porting `0.11456` as a constant. A budget fill is self-correcting if the score
+   distribution shifts; a fixed threshold is not, and the 600M rewritten text is a
+   different population (see item 4). Whichever is chosen, record the realized cutoff and
+   the retained fraction the way `_step4` did, so the next scale-up has the same evidence
+   this one had.
 
 2. **doc_id disjointness across arms is unverified.** Remainders are core-excluded but drawn
    from the same 577M pool by different criteria, so overlap between arms is expected and
@@ -603,17 +858,54 @@ Recorded here because the arithmetic route looked convincing and was not.
    numpy. Deliberately **not** added here: re-downloading 300M ids to check something the
    selection stage can check for free would be the wrong place for it.
 
-3. **`gpu_memory_utilization` disagreement in the source.** `07_rewrite/README.md:21` and the
+3. **`r` is transferred across document populations, and 261.49B is quoted more precisely
+   than that transfer supports.**
+
+   `r` was measured on the 1.5B corpora and applied to the round-4 remainders. These are
+   not the same population, in two ways that are easy to state and hard to quantify:
+
+   - **Selection differs.** The 1.5B `quality-first` was the top of the *full* pool. The
+     round-4 remainder is **core-excluded** — drawn from below the top 20B — so it is
+     lower-quality text by the same fastText ranking that defined the core.
+   - **Length differs, and `r` is not length-invariant.** Source documents run ~1,600
+     tok/doc in `quality-first` against ~949 in `wrap-inspired` and `rewire-inspired`
+     (`source_tokens_llama2 / docs`). Both rewrite prompts have a roughly fixed-cost
+     framing and a length-dependent body, and the distill prompt explicitly *condenses*,
+     so a shorter input does not simply scale its output down proportionally.
+
+   **Direction of the bias, as far as it can be reasoned:** core-exclusion should push `r`
+   **up** slightly for the four 60B arms. The distill prompt condenses proportionally more
+   from dense, information-rich text, and the core skimmed exactly that text off the top;
+   what remains is more repetitive and web-like, which tends to compress *less* per input
+   token under a "preserve the facts" instruction. That argues the estimates are mildly
+   conservative. This is an argument, not a measurement, and it is not strong enough to
+   lean on.
+
+   **Consequence for precision.** 261.49B is five significant figures on a quantity whose
+   dominant error term is an unquantified population transfer. Treat it as **~260B ± 10%**.
+   The per-arm figures inherit the same band. Nothing downstream breaks — the disk estimate
+   has slack and every arm's headroom in §6 exceeds 19% — but the two should be read
+   together: **`quality-first`'s +19.6% headroom sits inside this uncertainty band**, so if
+   `r` comes in ~16% below the transferred value that arm goes short of its 30B and would
+   need regenerating. That is the single most consequential open number in this document.
+
+   **This settles empirically on day one.** `scripts/06_calibrate.py` already
+   cross-checks measured tok/doc against the config's predicted value for the first job and
+   flags a disagreement beyond 2×. Tighten that comparison once real shards exist: after
+   the first few hundred shards of `quality-first__p2`, `r` is known to well within a
+   percent and every estimate here can be replaced with a measurement.
+
+4. **`gpu_memory_utilization` disagreement in the source.** `07_rewrite/README.md:21` and the
    argparse default say `0.90`; the sbatch that actually ran passes `0.85`
    (`07_rewrite/sbatch_template.sh:50-65`). This repo uses the value in `configs/vllm.yaml` and
    round 3 verified it; flagging only because the source is genuinely ambiguous and someone may
    later cite the README.
 
-4. **Style assignment cannot reproduce the 1.5B draw**, because shard boundaries differ (§2).
+5. **Style assignment cannot reproduce the 1.5B draw**, because shard boundaries differ (§2).
    If bitwise reproduction of the original wrap assignment ever matters, it would require
    carrying the source's shard boundaries, which are not preserved in the uploaded data.
    Assumed not to matter: this is a new corpus at a new scale.
 
-5. **`quality-base` has no home in this pipeline.** It is 50B raw tokens, 37.3M documents, and
+6. **`quality-base` has no home in this pipeline.** It is 50B raw tokens, 37.3M documents, and
    exists only at `01_before_rw/quality-base/`. Whoever assembles the final training mixes needs
    it; nothing in `rewrite-vllm` will produce or move it.

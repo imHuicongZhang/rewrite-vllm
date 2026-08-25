@@ -48,7 +48,7 @@ def human_time(hours: float) -> str:
 
 def rate_from_sidecars(cfg, jobs, min_shards: int):
     """Aggregate measured tok/s and tokens/doc from completed shards."""
-    tok = rows = 0
+    tok = rows = in_tok = 0
     gpu_secs = 0.0
     n = 0
     hosts, cards = set(), set()
@@ -58,6 +58,7 @@ def rate_from_sidecars(cfg, jobs, min_shards: int):
             if not sc or not sc.get("elapsed_s"):
                 continue
             tok += int(sc.get("n_output_tokens", 0))
+            in_tok += int(sc.get("n_prompt_tokens", 0))
             rows += int(sc.get("n_rows_out", 0))
             gpu_secs += float(sc["elapsed_s"])
             hosts.add(sc.get("host", "?"))
@@ -66,6 +67,7 @@ def rate_from_sidecars(cfg, jobs, min_shards: int):
     if n < min_shards or gpu_secs <= 0:
         return None
     return {"tok_s_per_gpu": tok / gpu_secs, "tok_per_doc": tok / max(1, rows),
+            "in_tok_s_per_gpu": in_tok / gpu_secs, "in_tok_per_doc": in_tok / max(1, rows),
             "shards": n, "hosts": len(hosts), "cards": sorted(c for c in cards if c != "?")}
 
 
@@ -99,14 +101,17 @@ def rate_by_measuring(cfg, jobs, n_docs: int):
     dt = time.perf_counter() - t0
 
     out_tok = sum(res.n_output_tokens)
+    in_tok = sum(prep.n_in_list)
     gpu = "?"
     try:
         import torch
         gpu = torch.cuda.get_device_name(0)
     except Exception:
         pass
-    print(f"  generated {out_tok:,} output tokens in {dt:.1f}s on {gpu}")
+    print(f"  generated {out_tok:,} output tokens from {in_tok:,} prompt tokens "
+          f"in {dt:.1f}s on {gpu}")
     return {"tok_s_per_gpu": out_tok / dt, "tok_per_doc": out_tok / max(1, len(texts)),
+            "in_tok_s_per_gpu": in_tok / dt, "in_tok_per_doc": in_tok / max(1, len(texts)),
             "shards": 0, "hosts": 1, "cards": [gpu]}
 
 
@@ -155,6 +160,34 @@ def main(argv=None) -> int:
     if r["cards"]:
         print(f"  on       : {', '.join(r['cards'])}")
     print(f"  fleet    : {ngpu} GPU(s) -> {tps * ngpu / 1e6:,.1f} M tok/s aggregate")
+
+    # ---- PREFILL vs DECODE --------------------------------------------------------
+    # This workload is prefill-heavy in a way most rewriting workloads are not: the
+    # configured budgets imply 720B input tokens against ~260B output, a 2.75:1 ratio.
+    # A single blended tok/s hides that, and prefill is the side most likely to be
+    # mistuned, so report the split explicitly.
+    itps = r.get("in_tok_s_per_gpu") or 0.0
+    itpd = r.get("in_tok_per_doc") or 0.0
+    if itps > 0:
+        ratio = itpd / tpd if tpd else 0.0
+        # Both phases ran in the same wall clock, so their token rates are throughputs
+        # over the SAME interval, not independent speeds. The useful decomposition is
+        # therefore the token MIX, which is what determines where the time goes once you
+        # know the per-phase cost. Prefill is compute-bound and roughly linear in tokens;
+        # decode is memory-bound and roughly linear in tokens x steps.
+        print()
+        print(f"  prefill  : {itps:,.0f} prompt tok/s per GPU, {itpd:,.0f} prompt tok/doc")
+        print(f"  decode   : {tps:,.0f} output tok/s per GPU, {tpd:,.0f} output tok/doc")
+        print(f"  mix      : {ratio:.2f} prompt tokens per output token "
+              f"({100*ratio/(1+ratio):.0f}% of all tokens processed are prefill)")
+        cfg_ratio = 720.0 / 261.5
+        flag = "" if abs(ratio - cfg_ratio) / cfg_ratio < 0.25 else \
+               "   <-- differs >25% from the configured 2.75:1; check the estimates"
+        print(f"             configured expectation is {cfg_ratio:.2f}:1{flag}")
+        print(f"  NOTE     : at this ratio prefill is a large share of GPU time. If you "
+              f"are tuning,\n             look at max_num_batched_tokens and chunked "
+              f"prefill BEFORE decode-side knobs.\n             Do not change engine args "
+              f"without asking Wytro -- source parity governs.")
 
     # Token VOLUME comes from configs/data.yaml's per-(arm, prompt) est_output_tokens,
     # which is source_tokens_llama2 x a MEASURED ratio -- not from the measured tok/doc of

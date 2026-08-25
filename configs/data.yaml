@@ -40,6 +40,37 @@
 #
 #   Token convention throughout: tokens-llama2 + 1 (one leading BOS), per
 #   02_select/select_600m.py:136,273.
+#
+# THE 50B INVARIANT -- the constraint the half+half structure exists to satisfy.
+#
+#   Every arm lands at 50B FINAL TRAINING tokens.
+#     quality-base    = 50B raw                       (top-50B prefix of the ftq order)
+#     every other arm = 20B raw core + 30B rewritten  = 50B
+#   Source: select_600m.py:78-79,358 (quality-base's 50B is stated as a final_training
+#   budget); 02_select/README.md (quality-base is the top-50B prefix, the core is the
+#   top-20B prefix of the SAME order, so quality-base already contains the core).
+#
+#   The remainder budgets below are SOURCE budgets and over-produce on purpose; the
+#   surplus is trimmed to 30B downstream ("Expect ~36B out of 60B and trim to budget,
+#   as at 1.5B" -- select_600m.py:122). Produced vs needed:
+#
+#     arm                  source   produced   needed   headroom
+#     quality-first          60B     35.88B      30B     +19.6%   <- tightest
+#     diversity-oriented     60B     39.94B      30B     +33.1%
+#     disagreement-aware     60B     38.40B      30B     +28.0%
+#     wrap-inspired          60B     47.82B      30B     +59.4%
+#     rewire-inspired       120B     99.46B      30B     +231%    <- roomiest
+#
+#   Every arm clears its budget, and each ratio reproduces the 1.5B run's headroom exactly
+#   (budgets scaled 6x and r was carried over). But see the precision caveat below.
+#
+# PRECISION OF THESE ESTIMATES. r was measured on the 1.5B corpora and transferred to
+# these remainders, which are a DIFFERENT document population -- core-excluded, and with
+# very different mean document length across arms (~1,600 tok/doc for quality-first vs
+# ~949 for wrap/rewire). Treat the totals as ~260B +/- 10%, not as five significant
+# figures. quality-first's +19.6% headroom sits inside that band: if r comes in ~16% low,
+# that arm goes short of 30B. scripts/06_calibrate.py cross-checks measured tok/doc against
+# these numbers on the first job -- read it. Full argument: docs/DESIGN_DELTA.md s10.3.
 # ---------------------------------------------------------------------------------------
 #
 # SEMANTICS -- the thing that is easiest to get wrong:
@@ -341,10 +372,32 @@ arms:
   # rewire-inspired carries kappa = 2 on the REMAINDER (120B, not 60B) -- not 2x on the
   # block total. Source: 02_select/select_600m.py:19-20,81.
   #
-  # The kappa=2 headroom exists to feed a post-rewrite filter: score the REWRITTEN text
-  # with fastText and keep the top half. THAT STAGE IS NOT IMPLEMENTED IN THIS PIPELINE.
-  # This arm will ship ~99.5B output tokens UNFILTERED, and someone must filter them before
-  # they enter a training mix. See docs/DESIGN_DELTA.md section 9, open question 1.
+  # ---------------------------------------------------------------------------------
+  # THE POST-REWRITE FILTER IS NOT IMPLEMENTED HERE. Read this before running it.
+  #
+  # The kappa=2 headroom exists to feed a filter that scores the REWRITTEN text with
+  # fastText and fills to this arm's 30B training budget. This pipeline does not do that,
+  # so the arm ships ~99.5B output tokens UNFILTERED and someone must cut them to 30B
+  # before they enter a training mix.
+  #
+  # It is a FIXED-BUDGET FILL, not "the top half" and not a fixed score threshold.
+  # 10_postprocess/_step4_rewrite_summary.json at 1.5B, verbatim:
+  #     pipeline: "rewrite broadly -> fasttext score rewritten -> keep top 5B"
+  #     selection_note: "... token-budget-matched top-5B (NOT the paper top-10%)"
+  #     pool_tokens 16,221,811,013 -> kept_tokens 5,000,000,351   (30.8% retained)
+  #     target 5,000,000,000   overshoot 351   filled true
+  #     fasttext_score_cutoff 0.1145634651184082
+  # The cutoff is the OUTPUT of filling to the target, not an input. Do not port 0.11456
+  # as a constant: the 600M rewritten text is a different population, so its score
+  # distribution will differ, and a budget fill self-corrects where a threshold does not.
+  # RECOMMENDED (not decided): fill_to(order_by_fasttext_desc, tokens, 30e9), and record
+  # the realized cutoff and retained fraction the way _step4 did.
+  #
+  # Headroom is comfortable, not tight: 30B needed / 99.5B produced = 30.2% required
+  # retention, against 30.8% realized at 1.5B -- kappa=2 was sized so the pool-to-budget
+  # ratio carries over (3.32x here, 3.24x there). This is the ROOMIEST of the five arms.
+  # The tightest is quality-first at +19.6%. See docs/DESIGN_DELTA.md section 6.
+  # ---------------------------------------------------------------------------------
   - name: rewire-inspired
     subdir: rewire-inspired
     docs: 126480544

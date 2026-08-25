@@ -292,6 +292,40 @@ Agent: **do not decide these yourself.** Stop, ask, and wait.
 
 ---
 
+## 4.5 If throughput looks wrong: this workload is prefill-heavy
+
+Worth knowing before you reach for a tuning knob, because the usual instinct is the wrong
+one here.
+
+The configured budgets imply **720B input tokens against ~260B output — a 2.75:1 ratio**.
+Most rewriting workloads sit near 1:1. Here roughly **three quarters of all tokens the GPUs
+touch are prompt tokens**, so prefill, not decode, is where the wall clock mostly goes.
+
+`scripts/06_calibrate.py` now reports the two separately — prompt tok/s and output tok/s,
+the measured mix, and whether that mix matches the 2.75:1 the config expects. Read that
+before concluding anything is slow. A blended tok/s number will look mediocre on this
+workload even when the engine is behaving perfectly.
+
+**This is not a new or untested regime.** The originating 1.5B run had the same shape: its
+own census counters give 192.6B input against 69.5B output, **2.77:1** — within 1% of ours.
+It ran to completion on the same engine version with the same settings.
+
+**The settings that matter here are the ones vLLM chose by itself.** The source never passed
+`max_num_batched_tokens` or `enable_chunked_prefill`; it inherited
+`max_num_batched_tokens=16384` and `enable_chunked_prefill=True` from vLLM's defaults, and
+those are recorded in `configs/vllm.yaml` under `inherited_defaults_do_not_pass` — copied
+from the engine's own config dump in the source's logs. So the prefill path in this run is
+already the exact path that produced the 1.5B corpus at 2.77:1.
+
+**Do not change them.** Round 3 verified the engine args and source parity governs: any
+engine arg the source did not pass changes generation behaviour at `temperature=0` and
+destroys comparability across arms. `config.py` rejects additions outright. If your
+measurements genuinely suggest the inherited prefill settings are mistuned for your
+hardware, that is a finding to bring to Wytro with the numbers attached — a decision about
+the experiment, not a local tuning change.
+
+---
+
 ## 5. Troubleshooting
 
 | symptom | what it means | what to do, in order |

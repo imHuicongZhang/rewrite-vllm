@@ -95,6 +95,42 @@ with the others.
 """
 
 
+REWIRE_CAVEAT = """
+## This arm is UNFILTERED — it must be cut to budget before training
+
+`rewire-inspired` was given a doubled source budget (120B rather than 60B, κ=2)
+specifically so that a post-rewrite filter would have room to work: score the **rewritten**
+text with fastText, sort descending, and fill to the arm's **30B** training-token budget.
+
+**That filter is not part of this pipeline.** What is published here is the full
+~99.5B-token output. Training on it as-is would give this arm 3.3× the tokens every other
+arm gets and would skip the quality selection the arm's design depends on.
+
+### It is a fixed-budget fill, not "the top half"
+
+From the originating 1.5B run (`10_postprocess/_step4_rewrite_summary.json`):
+
+| | |
+|---|---|
+| pipeline | rewrite broadly → fastText-score the rewritten text → keep top 5B |
+| selection | token-budget-matched top-5B (**not** the paper's top-10%) |
+| pool | 16,221,811,013 tokens |
+| kept | 5,000,000,351 tokens — **30.8% retained** |
+| target / overshoot | 5,000,000,000 / 351 — `filled: true` |
+| realized score cutoff | 0.1145634651184082 |
+
+The cutoff is the **output** of filling to the target, not an input to the filter.
+
+**Recommended:** reproduce that — `fill_to(order_by_score_desc, tokens, 30e9)` — rather than
+porting `0.11456` as a constant. This corpus is a different document population from the
+1.5B one, so its rewritten-text score distribution will differ; a budget fill self-corrects,
+a fixed threshold does not. Record the realized cutoff and retained fraction either way.
+
+**Headroom is comfortable.** Required retention here is `30B / 99.5B = 30.2%`, against
+30.8% realized at 1.5B — κ=2 was sized so the pool-to-budget ratio carries over.
+"""
+
+
 def dataset_card(cfg, job, files, nbytes) -> str:
     """A README.md for the Hub repo.
 
@@ -149,6 +185,8 @@ for training use; the others are retained so row counts match the input exactly.
 """
     if job.arm == "wrap-inspired":
         card += WRAP_CAVEAT
+    if job.arm == "rewire-inspired":
+        card += REWIRE_CAVEAT
     return card
 
 
@@ -236,8 +274,9 @@ def main(argv=None) -> int:
             path_or_fileobj=str(card_p), path_in_repo="README.md",
             repo_id=name, repo_type="dataset",
             commit_message="dataset card"), f"upload card {name}")
-        print(f"    card uploaded" + ("  (includes the wrap style-assignment note)"
-                                      if job.arm == "wrap-inspired" else ""))
+        _note = {"wrap-inspired": "  (includes the wrap style-assignment note)",
+                 "rewire-inspired": "  (includes the UNFILTERED / cut-to-30B warning)"}
+        print(f"    card uploaded" + _note.get(job.arm, ""))
         with_retry(lambda: api.upload_folder(
             repo_id=name, repo_type="dataset", folder_path=str(src),
             path_in_repo="data",

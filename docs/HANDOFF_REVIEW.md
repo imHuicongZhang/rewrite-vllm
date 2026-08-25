@@ -1311,3 +1311,210 @@ shuffle, claiming, reaping, the Blackwell-only constraint, `min_shards_per_gpu`.
 4. **`gpu_memory_utilization` is genuinely ambiguous in the source** — `0.90` in
    `07_rewrite/README.md:21` and the argparse default, `0.85` in the sbatch that actually
    ran. Unchanged here; flagged only so nobody later "fixes" it by citing the README.
+
+---
+
+# Addendum — 2026-08-25 (later): round 5, closing the loose ends
+
+Small round. Five items plus a prompt-provenance check, no scope expansion. `DESIGN_DELTA.md`
+is updated in place; this is the disposition list.
+
+**Two of the five items in the brief turned out to be wrong, and both inverted a conclusion.**
+That is §2 and §4 below.
+
+## §1 The 50B invariant — ADDED, and the brief's 30B target is correct
+
+**Disposition: done. The inferred number checks out.**
+
+`DESIGN_DELTA` §6 now states the constraint the half+half structure exists to satisfy:
+**every arm lands at 50B final training tokens.** `quality-base` is 50B raw; every other arm
+is 20B raw core + 30B rewritten.
+
+The brief flagged the 30B as inferred from structure rather than read from source. It is
+correct, and the source does support it:
+
+- `select_600m.py:78-79` — `CORE_TARGET = 20B`, `QBASE_TARGET = 50B`.
+- `select_600m.py:358` — quality-base's 50B is explicitly a **`final_training`** budget:
+  *"All 50B is used as-is; never rewritten. This is what the model trains on."* It is the
+  only arm whose final budget is stated directly, so it sets the target for the others.
+- `02_select/README.md` + `verify_materialize.py:116-126` — `quality-base` is the **top-50B
+  prefix** of the same `ftq` order whose top-20B prefix is the core, so it already *contains*
+  the core. It is `20B core + 30B next-best raw`, and the other arms must match at 50B.
+- 1.5B analogue: `select_10b.py:48-51` has `SHARED_TARGET = 5B` / `TARGET = 10B`, and the
+  postprocess mixed a 5B core with a 5B rewritten selection. 10B = 5B + 5B there,
+  50B = 20B + 30B here. The core's share moved from 50% to 40% between scales; the invariant
+  is the 50B total, not the split.
+
+The produced-vs-needed table is in `DESIGN_DELTA` §6 and in the header of `configs/data.yaml`.
+The brief's headroom figures were right to within rounding, except rewire — see §2.
+
+## §2 rewire's "3% headroom" — WRONG. It is the roomiest arm, not the tightest.
+
+**Disposition: the "top half" error is fixed everywhere. The conclusion drawn from it is
+reversed, with evidence.**
+
+The wording error was real and is corrected in `DESIGN_DELTA` §10.1, `configs/data.yaml`, and
+the generated dataset card for that arm. But the error was deeper than a fraction:
+
+`_step4_rewrite_summary.json` states the mechanism outright —
+
+> `pipeline`: "rewrite broadly → fasttext score rewritten → **keep top 5B**"
+> `selection_note`: "…token-budget-matched top-5B (**NOT the paper top-10%**)"
+> `target: 5000000000`, `overshoot: 351`, `filled: true`
+
+**It is a fixed-BUDGET fill, not a fixed threshold.** The cutoff `0.1145634651184082` is the
+*output* of filling to a 5B target, not an input. The brief's stated risk — "a fixed threshold
+retains a different fraction at this scale, and a few points down puts the arm short" — does
+not apply, because a budget fill cannot come up short while the pool exceeds the budget. What
+moves instead is the cutoff score, i.e. the *quality* of the kept set.
+
+**And the headroom is not 3%.** Required retention is `30B / 99.46B = 30.2%`, against 30.8%
+realized at 1.5B — near-identical, because κ=2 was sized so the pool-to-budget ratio carries
+over (3.32× here, 3.24× there). Produced ÷ needed:
+
+| arm | produced | needed | headroom |
+|---|---:|---:|---:|
+| quality-first | 35.88B | 30B | **+19.6%** ← tightest |
+| diversity-oriented | 39.94B | 30B | +33.1% |
+| disagreement-aware | 38.40B | 30B | +28.0% |
+| wrap-inspired | 47.82B | 30B | +59.4% |
+| rewire-inspired | 99.46B | 30B | **+231%** ← roomiest |
+
+Each ratio is `r_arm × source / 30B`, so it reproduces the 1.5B headroom identically — budgets
+scaled 6× and `r` was carried over. Every arm demonstrably filled at 1.5B
+(`shortfall_vs_target: 0`; `filled: true`). **The tight arm is `quality-first` at +19.6%**, and
+what threatens it is not the filter but the `r` transfer in §4.
+
+Recommendation recorded, not decided: implement as `fill_to(order_by_score_desc, tokens, 30e9)`
+rather than porting `0.11456`, since a budget fill self-corrects if the score distribution
+shifts and the 600M rewritten text is a different population. Filter still not implemented;
+still Wytro's.
+
+## §3 The two overhead-verification paths — CHECKED, both still correct
+
+**Disposition: verified, nothing was broken. Measured, not assumed.**
+
+Against the real Qwen2.5-7B-Instruct tokenizer on disk, all six templates match:
+`p1_wiki` 150, `p2_distill` 185, `wrap_easy` 72, `wrap_hard` 66, `wrap_wiki` 73, `wrap_qa` 83.
+
+All four wrap values are asserted, in three independent places:
+
+- **runtime** — `PromptSpec.overheads()` yields one triple per prompt *text* (four for the
+  styled pass); `engine.check_overheads()` measures each; `run_worker` fails the job if any
+  mismatches and names which. Expected values live per style in
+  `prompt_defs.wrap_styled.styles[*].expected_overhead`. The sidecar records a dict of four
+  for that job rather than a single integer.
+- **preflight check 6** — same expansion, and it prints `n_texts` (6 across 10 jobs), so a
+  silent collapse to one text per job shows up as a changed count.
+- **`verify_prompt_parity.py`** — runs standalone from the YAML without `config.py`'s loader,
+  so it needed its own `_units()` expansion; it prints every expected-vs-actual pair and
+  independently re-checks the style ORDER against `["easy","hard","wiki","qa"]`.
+
+Four values asserted where there were four before. Neither check narrowed to a single style.
+
+## §4 `r` transferred across populations — ACKNOWLEDGED, and it is the real risk
+
+**Disposition: added as open question 3; precision reduced where it was overstated.**
+
+The brief is right that 261.49B claims precision the transfer does not support. Recorded in
+`DESIGN_DELTA` §10.3: the 1.5B `quality-first` was the top of the *full* pool while the
+round-4 remainder is **core-excluded**, and mean document length varies ~1,600 tok/doc
+(`quality-first`) against ~949 (`wrap`, `rewire`), with `r` not length-invariant.
+
+**Direction of bias, reasoned:** core-exclusion should push `r` slightly **up** for the four
+60B arms — the distill prompt condenses proportionally more from dense text, and the core
+skimmed exactly that off the top, leaving more repetitive material that compresses less under
+a preserve-the-facts instruction. So the estimates are probably mildly conservative. An
+argument, not a measurement; not strong enough to lean on.
+
+Totals are now quoted as **~260B ± 10%** in the summary table and in `data.yaml`; the exact
+figure is retained only where the arithmetic is shown.
+
+**This is where §2's concern actually belongs.** `quality-first`'s +19.6% headroom sits inside
+that band: if `r` lands ~16% below the transferred value, that arm goes short of its 30B and
+needs regenerating. It is the single most consequential open number in the document — and it
+settles empirically on day one, from `06_calibrate.py`'s cross-check against the first job.
+
+## §5 Prefill split — ADDED. No mistuning found.
+
+**Disposition: reporting added; engine args untouched; the brief's implied concern does not
+hold.**
+
+`06_calibrate.py` now carries prompt tokens through both rate paths (sidecars and the live
+measurement) and reports prefill and decode separately: prompt tok/s, output tok/s, the
+measured mix, and whether it matches the 2.75:1 the config implies — flagging >25% divergence,
+which would mean the token estimates are wrong rather than the engine. Guidance for Tianjian
+is in `GUIDE_FOR_TIANJIAN.md` §4.5.
+
+**On whether the inherited values look mistuned: no, and the evidence is direct.** The source
+ran the same shape — its census counters give 192.6B input against 69.5B output, **2.77:1**,
+within 1% of ours — on the same engine version, to completion. It never passed
+`max_num_batched_tokens` or `enable_chunked_prefill`; it inherited
+`max_num_batched_tokens=16384` / `enable_chunked_prefill=True`, visible in its own logged
+config dump (`07_rewrite/logs/rw_*.out:6,9`) and already recorded in `configs/vllm.yaml` under
+`inherited_defaults_do_not_pass`. So the prefill path here is the one that produced the 1.5B
+corpus at this exact ratio. Nothing changed; the guide frames it as measure-first and bring
+findings to Wytro.
+
+## §6 Prompt provenance vs the published originals — **ONE DIFFERENCE, STOPPED**
+
+**Disposition: comparison done, difference found, NOTHING adopted. This is a blocker.**
+
+Full detail in `DESIGN_DELTA` §9. Summary:
+
+`blab-jhu/KYS-Configs` is **also `gated: manual`** and its `prompts/` files 401 unauthenticated.
+The comparison was done with **git blob SHA-1 OIDs** from the Hub tree API, which are SHA-1
+over exact file bytes and are published even when content is not — byte-exact, not a proxy.
+
+| template | ours | theirs | identical |
+|---|---|---|---|
+| wiki-grounded | 597 B / `802aff3d…` | 597 B / `802aff3d…` | **YES** |
+| distill | 842 B / `200cd2c3…` | 841 B / `38da40ce…` | **NO** |
+| wrap ×4 | four `.txt` | one `wrap_prompts.json` 972 B / `07930c8e…` | **INCONCLUSIVE** |
+
+**The distill difference is one trailing newline**, proven: stripping a single `\n` from our
+842-byte file reproduces their OID exactly.
+
+**What it costs, measured:** empty-doc overhead **185 either way**; total templated length 200
+either way; **token IDs differ at exactly one position** — ours emits token `624` = `'.\n'`
+where the original emits `13` = `'.'`, immediately before `<|im_end|>`.
+
+So it is a real difference that reaches the model — at `temperature=0` a different token
+sequence can produce different text, and this template is used by **5 of the 10 jobs** — while
+being completely invisible to the overhead fingerprint. **This corrects the brief's premise:**
+a trailing newline does *not* shift the overhead for this tokenizer, because Qwen merges
+`.` + `\n` into one token. An unchanged overhead is not evidence that a template is unchanged.
+That strengthens the case for the byte comparison rather than weakening it.
+
+**Nothing was adopted, in either direction**, and no `expected_overhead` was changed. Two
+questions need content access:
+
+1. **Which side is authoritative for distill?** Our reconstruction is what round 3 verified
+   against 18,000 logged 1.5B distill rows. If the 1.5B run itself used the trailing-newline
+   form, the *published* file is the one that drifted and adopting it would break parity with
+   the corpus being matched. The rendered `templated_input` fields in
+   `00_Prompts/generations/nemotron_distill_1.5B.jsonl` settle this directly.
+2. **The four wrap templates are unverified.** 18,432 candidate JSON serialisations of our four
+   texts were tried against `07930c8e…` and none matched — *inconclusive*, not a difference:
+   the original's serialisation is unknown. Their four overheads do match (72/66/73/83), which
+   is weak positive evidence and, as the distill case just showed, not conclusive.
+
+Overhead assertions kept as the cheap runtime guard. They cannot be re-derived from the
+originals until access is granted — that is B6 in `DESIGN_DELTA` §7.
+
+## §7 What was and was not executed
+
+**Ran, green:** `test_wrap_styles` 33/33; `test_integration` all checks; `compileall` over
+`src scripts tests`; `data.yaml` YAML parse. Trim and shuffle parity were not re-run — nothing
+in this round touched `postprocess.py` or `shuffle.py`.
+
+**New measurement this round:** all six template overheads against the real Qwen2.5-7B-Instruct
+tokenizer at `/weka/scratch/jhu/bvandur1/zhuicon1/models/Qwen2.5-7B-Instruct` — the first time
+this repo's overheads have been checked against the real tokenizer rather than assumed from
+round 3. All six match.
+
+**Not run:** `preflight.py` end to end and `verify_prompt_parity.py` (need filled cluster
+paths). No GPU work.
+
+**Untouched:** engine args, sampling params, prompts, trim rules, shuffle, claiming, reaping.
+The ReWire filter and the doc_id disjointness check remain unimplemented by decision.
