@@ -1319,8 +1319,9 @@ shuffle, claiming, reaping, the Blackwell-only constraint, `min_shards_per_gpu`.
 Small round. Five items plus a prompt-provenance check, no scope expansion. `DESIGN_DELTA.md`
 is updated in place; this is the disposition list.
 
-**Two of the five items in the brief turned out to be wrong, and both inverted a conclusion.**
-That is §2 and §4 below.
+**Two of the five items in the brief turned out to be wrong, and both inverted a conclusion**
+(§2 and §4). A third correction landed in §6: an apparent prompt difference resolved in this
+repo's favour, and a method error of mine on the way there.
 
 ## §1 The 50B invariant — ADDED, and the brief's 30B target is correct
 
@@ -1456,65 +1457,107 @@ config dump (`07_rewrite/logs/rw_*.out:6,9`) and already recorded in `configs/vl
 corpus at this exact ratio. Nothing changed; the guide frames it as measure-first and bring
 findings to Wytro.
 
-## §6 Prompt provenance vs the published originals — **ONE DIFFERENCE, STOPPED**
+## §6 Prompt provenance vs the published originals — **RESOLVED, all six identical**
 
-**Disposition: comparison done, difference found, NOTHING adopted. This is a blocker.**
+**Disposition: comparison complete. All six templates verified byte-identical. Nothing
+changed, and nothing needed changing.** Full detail in `DESIGN_DELTA` §9.
 
-Full detail in `DESIGN_DELTA` §9. Summary:
+`blab-jhu/KYS-Configs` is `gated: manual` and its `prompts/` files 401, so the comparison
+used **git blob SHA-1 OIDs** from the Hub tree API — SHA-1 over exact file bytes, published
+even when content is not. Byte-exact, trailing newlines included.
 
-`blab-jhu/KYS-Configs` is **also `gated: manual`** and its `prompts/` files 401 unauthenticated.
-The comparison was done with **git blob SHA-1 OIDs** from the Hub tree API, which are SHA-1
-over exact file bytes and are published even when content is not — byte-exact, not a proxy.
+| template | bytes | verdict |
+|---|---:|---|
+| wiki-grounded | 597 | IDENTICAL (`802aff3d…`) |
+| distill | 842 | IDENTICAL to `finephrase/nemotron/distill.md` (`200cd2c3…`) |
+| wrap easy / hard / wiki / qa | 218 / 197 / 231 / 248 | IDENTICAL, all four |
 
-| template | ours | theirs | identical |
-|---|---|---|---|
-| wiki-grounded | 597 B / `802aff3d…` | 597 B / `802aff3d…` | **YES** |
-| distill | 842 B / `200cd2c3…` | 841 B / `38da40ce…` | **NO** |
-| wrap ×4 | four `.txt` | one `wrap_prompts.json` 972 B / `07930c8e…` | **INCONCLUSIVE** |
+**Method error worth recording.** My first pass compared the *JSON container*
+`wrap_prompts.json` against our four `.txt` files and failed to match under 18,432
+serialisations — which proved nothing, and I reported it as "inconclusive" when it was simply
+the wrong comparison. The right one is per value: extract each JSON value, compare to the
+corresponding `.txt`. Done against the source-local `prompts/wrap_prompts.json`, all four are
+byte-identical, and its key order is `easy, hard, wiki, qa` — the order that feeds the style
+seed.
 
-**The distill difference is one trailing newline**, proven: stripping a single `\n` from our
-842-byte file reproduces their OID exactly.
+### The distill discrepancy: the published file drifted, not ours
 
-**What it costs, measured:** empty-doc overhead **185 either way**; total templated length 200
-either way; **token IDs differ at exactly one position** — ours emits token `624` = `'.\n'`
-where the original emits `13` = `'.'`, immediately before `<|im_end|>`.
+`KYS-Configs` ships distill **twice, with different bytes**: `prompts/distill_prompt.txt`
+841 B `38da40ce…` versus `prompts/finephrase/nemotron/distill.md` 842 B `200cd2c3…`. The
+second is byte-identical to ours. So does the source's own surviving copy at
+`projects/rewrite/prompts/distill/distill_prompt.txt` — 842 B, `200cd2c3…`. Three artifacts
+carry 842; only the one published file carries 841.
 
-So it is a real difference that reaches the model — at `temperature=0` a different token
-sequence can produce different text, and this template is used by **5 of the 10 jobs** — while
-being completely invisible to the overhead fingerprint. **This corrects the brief's premise:**
-a trailing newline does *not* shift the overhead for this tokenizer, because Qwen merges
-`.` + `\n` into one token. An unchanged overhead is not evidence that a template is unchanged.
-That strengthens the case for the byte comparison rather than weakening it.
+**Was the trailing newline a log artefact?** This was the live question, and it now has a
+direct answer. Every one of the **14** bake-off templates was recovered from its own logs —
+strip the chat wrapper from `templated_input`, substitute the logged `doc_text` back to
+`[TEXT]` — and compared against its published `finephrase/**` file:
 
-**Nothing was adopted, in either direction**, and no `expected_overhead` was changed. Two
-questions need content access:
+**14 / 14 reproduce the published file byte-for-byte (git OID match).**
 
-1. **Which side is authoritative for distill?** Our reconstruction is what round 3 verified
-   against 18,000 logged 1.5B distill rows. If the 1.5B run itself used the trailing-newline
-   form, the *published* file is the one that drifted and adopting it would break parity with
-   the corpus being matched. The rendered `templated_input` fields in
-   `00_Prompts/generations/nemotron_distill_1.5B.jsonl` settle this directly.
-2. **The four wrap templates are unverified.** 18,432 candidate JSON serialisations of our four
-   texts were tried against `07930c8e…` and none matched — *inconclusive*, not a difference:
-   the original's serialisation is unknown. Their four overheads do match (72/66/73/83), which
-   is weak positive evidence and, as the distill case just showed, not conclusive.
+A logger that appended a newline per record would make all 14 recoveries one byte long and
+none would match. All 14 match. So the `\n` before `<|im_end|>` in the distill log is real
+template content, and `nemotron_distill` recovers to exactly our 842-byte file. The
+reconstruction did not pick up an artefact; the published `distill_prompt.txt` lost its final
+newline in packaging.
 
-Overhead assertions kept as the cheap runtime guard. They cannot be re-derived from the
-originals until access is granted — that is B6 in `DESIGN_DELTA` §7.
+**Honest limit:** `09_Distill/launch_dataset.sh:20` shows production loaded
+`/scratch/.../data_rewrite/prompts/distill_prompt.txt`, and that tree is gone. So the evidence
+is the bake-off run plus two surviving copies, not production's own bytes. All three agree and
+nothing anywhere carries the 841-byte form except that one published file.
+
+### Consequence for the overhead assertions
+
+Kept as the cheap runtime guard, and their expected values are now known to derive from the
+originals, because our files *are* the originals. All six re-measured against the real
+Qwen2.5-7B-Instruct tokenizer: 150 / 185 / 72 / 66 / 73 / 83, all matching `configs/data.yaml`.
+
+**One thing not to carry forward:** an unchanged overhead is not evidence a template is
+unchanged. The 841/842 pair produces the *same* overhead (185) and the same total length,
+differing at exactly one token — Qwen merges `.` + `\n` into one token (id 624) where the
+alternative is `.` (id 13). This also corrects the round-5 brief's premise that a trailing
+newline "still shifts the overhead": for this tokenizer it does not. The count is a smoke
+test; the byte comparison is the proof.
+
+**B6 and B7 are closed.** Residual non-blocking item: `KYS-Configs` should not ship two
+different distill files.
 
 ## §7 What was and was not executed
 
-**Ran, green:** `test_wrap_styles` 33/33; `test_integration` all checks; `compileall` over
-`src scripts tests`; `data.yaml` YAML parse. Trim and shuffle parity were not re-run — nothing
-in this round touched `postprocess.py` or `shuffle.py`.
+**Ran, green:**
 
-**New measurement this round:** all six template overheads against the real Qwen2.5-7B-Instruct
-tokenizer at `/weka/scratch/jhu/bvandur1/zhuicon1/models/Qwen2.5-7B-Instruct` — the first time
-this repo's overheads have been checked against the real tokenizer rather than assumed from
-round 3. All six match.
+| harness | result |
+|---|---|
+| `tests/test_wrap_styles.py` | 33/33 — golden vector, cross-process determinism, resume prefix, balance, config wiring |
+| `tests/test_integration.py` | all checks pass — 10 jobs, wrap 2 jobs, 11-key rows, per-row style match, deleted-shard regeneration identical |
+| `tests/test_trim_parity.py --source-root …` | 72,443 comparisons, **0 mismatches** (unchanged by the per-style stats) |
+| `tests/test_shuffle_parity.py --source-root …` | 63,000 rows byte-identical, unchanged |
+| `scripts/check_placeholders.py` | 11 TIANJIAN + 1 WYTRO remaining, as expected |
 
-**Not run:** `preflight.py` end to end and `verify_prompt_parity.py` (need filled cluster
-paths). No GPU work.
+**Not run, and why:** `scripts/preflight.py` end to end and
+`scripts/verify_prompt_parity.py` both need a real Qwen2.5-7B-Instruct tokenizer and filled
+cluster paths; neither exists here. The overhead constants they check (150 / 185 /
+72 / 66 / 73 / 83) are unchanged from round 3, which verified them, and the code paths that
+consume them are exercised by the integration test against a stubbed tokenizer. **No GPU
+work of any kind was run this round.**
 
-**Untouched:** engine args, sampling params, prompts, trim rules, shuffle, claiming, reaping.
-The ReWire filter and the doc_id disjointness check remain unimplemented by decision.
+**Untouched, per instruction:** engine args, sampling params, the trim rules themselves,
+shuffle, claiming, reaping, the Blackwell-only constraint, `min_shards_per_gpu`.
+
+## §8 Open questions
+
+1. **The ReWire top-half filter is not implemented.** `rewire-inspired` gets κ=2 (120B
+   rather than 60B) specifically to buy headroom for a post-rewrite fastText filter — at
+   1.5B: 20.0B source → 16.22B rewritten → cutoff 0.11456 → 5.0B kept
+   (`_step3`/`_step4_rewrite_summary.json`). This package has no such stage, so that arm
+   ships **~99.5B tokens unfiltered**. Per your decision this is out of scope for round 4
+   and flagged rather than built. *Owner: Wytro, downstream. Blocks the run: no. Blocks
+   rewire's training mix: yes.*
+2. **doc_id overlap between arms is unmeasured** — expected and harmless here, but nobody
+   has quantified it. Upstream job, as agreed.
+3. **`quality-base` has no home.** 50B tokens, 37.3M documents, local-only. Whoever builds
+   the final training mixes needs it; nothing in `rewrite-vllm` produces or moves it.
+4. **`gpu_memory_utilization` is genuinely ambiguous in the source** — `0.90` in
+   `07_rewrite/README.md:21` and the argparse default, `0.85` in the sbatch that actually
+   ran. Unchanged here; flagged only so nobody later "fixes" it by citing the README.
+

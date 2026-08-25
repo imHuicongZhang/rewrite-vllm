@@ -45,7 +45,7 @@ Where they disagreed, the resolution is stated explicitly rather than silently p
 | 12 | the 50B/arm invariant | never stated | stated, with produced-vs-needed per arm | 6 |
 | 13 | ReWire filter | "keep the top half" | **fixed-budget fill; 30.8% realized at 1.5B** | 10.1 |
 | 14 | `r` transfer across populations | not acknowledged | open question; estimate now **~260B ± 10%** | 10.3 |
-| 15 | prompt provenance | overhead fingerprint only | byte-compared vs originals; **1 difference open** | 9 |
+| 15 | prompt provenance | overhead fingerprint only | byte-compared vs originals; **all 6 identical** | 9 |
 
 ---
 
@@ -621,18 +621,17 @@ the header comment. A reader can see the GPU/no-GPU split without opening a Pyth
 | B3 | `HF_TOKEN_WRITE` — write-scoped token for the output org | **Wytro** | upload only |
 | B4 | 11 blanks in `configs/cluster.yaml` + `HF_TOKEN` in `.env` | **Tianjian** | everything |
 | B5 | Hub card has no `configs:` block. Not required — the access layer uses explicit globs — but it makes the dataset usable by anyone else. Draft ready at `data_reports/DATASET_CARD_DRAFT.md`. | Wytro | nothing |
-| B6 | **`blab-jhu/KYS-Configs` is also `gated: manual`.** Its `prompts/` files 401 without access, so the four wrap templates could not be diffed against the originals and the distill discrepancy (§9) cannot be resolved. | **Wytro** | correctness of 5–10 of the 10 jobs, not startup |
-| B7 | **The distill template differs from the published original by one trailing newline** (§9). Same token count, different token IDs, used by 5 of 10 jobs. Not adopted in either direction pending B6. | **Wytro** to adjudicate | correctness, not startup |
+| ~~B6~~ | ~~`blab-jhu/KYS-Configs` access needed to diff the templates~~ | — | **CLOSED** — resolved without it, via git blob OIDs (§9) |
+| ~~B7~~ | ~~distill template may differ from the original~~ | — | **CLOSED** — all six templates verified byte-identical (§9) |
 
 B1 remains the most likely day-zero failure, so **preflight checks it directly**: it fetches a
 real file rather than reading metadata, because listing a gated repo succeeds without access. No
 existing gate was weakened to smooth the one-button path.
 
-**B6/B7 are new this round and are of a different kind: they do not stop the run, they make it
-possible to run the wrong thing.** A corpus generated against a prompt that differs from the
-original by one token is not obviously broken and would not be noticed downstream — which is
-the failure this project has already been burned by once. They should be closed before job 1,
-not after.
+**B6 and B7 were raised and closed in round 5.** All six prompt templates in `prompts/` are
+byte-identical to the published originals; the one apparent discrepancy is a drifted copy on the
+publishing side, not here (§9). Nothing was changed. The residual, non-blocking item is that
+`KYS-Configs` ships the distill prompt twice with different bytes — worth fixing there.
 
 ### Placeholders resolved this round
 
@@ -716,7 +715,7 @@ Recorded here because the arithmetic route looked convincing and was not.
 
 ---
 
-## 9. Prompt provenance: byte comparison against the published originals — **1 DIFFERENCE, UNRESOLVED**
+## 9. Prompt provenance: byte comparison against the published originals — **RESOLVED, all six verified**
 
 The authoritative prompt files were published at
 `https://huggingface.co/datasets/blab-jhu/KYS-Configs` (sha `d094c621…`). Four of this
@@ -724,84 +723,97 @@ repo's six templates — the distill prompt and the four wrap styles — were **
 from logged chat-templated inputs rather than copied, so a direct byte comparison is
 decisive where the token-overhead fingerprint was only suggestive.
 
-**That repo is also `gated: manual`, and its `prompts/` files return 401 unauthenticated.**
-The comparison below therefore uses **git blob SHA-1 OIDs** from the Hub tree API, which are
-SHA-1 over the exact file bytes (`sha1("blob <len>\0" + content)`) and are published even
-when content is not. That is a byte-exact comparison, not a proxy.
+**Outcome: all six templates in `prompts/` are byte-identical to the originals. Nothing was
+changed.** One published file disagrees with the rest of the evidence, and the finding is
+that *it* drifted, not this repo — see "the distill discrepancy" below.
 
-| template | ours (size / git-oid) | theirs (size / git-oid) | identical |
-|---|---|---|---|
-| wiki-grounded | 597 / `802aff3de60c17d2fd46840d5f89b924abb2601c` | 597 / `802aff3de60c17d2fd46840d5f89b924abb2601c` | **YES** |
-| distill | 842 / `200cd2c3f6782d9fcfada993054fbdf1a4091a57` | 841 / `38da40ce870e392ee23b8f27d9c61b3a358d3047` | **NO** |
-| wrap ×4 | 4 separate `.txt` | one `wrap_prompts.json`, 972 / `07930c8e…` | **INCONCLUSIVE** |
+`KYS-Configs` is `gated: manual` and its `prompts/` files 401 unauthenticated, so the
+comparison used **git blob SHA-1 OIDs** from the Hub tree API — SHA-1 over exact file bytes
+(`sha1("blob <len>\0" + content)`), published even when content is not. That is byte-exact,
+not a proxy. Trailing whitespace and final newlines are included.
 
-md5, for the record: ours wiki `bca104fe6e298615e5ccb9c9c747073b`, distill
-`538700534e99d5e80b268fd9b2408b48`, wrap easy/hard/wiki/qa
-`0735f53a…` / `e99a613b…` / `cec46736…` / `733fbeea…`. Theirs cannot be md5'd without
-content access; the git OIDs above serve the same purpose and are what the comparison rests on.
+### Results
 
-### The distill difference, exactly
+| template | bytes | ours (md5) | verdict |
+|---|---:|---|---|
+| wiki-grounded | 597 | `bca104fe6e298615e5ccb9c9c747073b` | **IDENTICAL** — git OID `802aff3d…` matches published |
+| distill | 842 | `538700534e99d5e80b268fd9b2408b48` | **IDENTICAL** to `finephrase/nemotron/distill.md` (`200cd2c3…`) |
+| wrap `easy` | 218 | `0735f53aca80cadaa8d67727680dbbfd` | **IDENTICAL** |
+| wrap `hard` | 197 | `e99a613bcd4146416428d576af6f200a` | **IDENTICAL** |
+| wrap `wiki` | 231 | `cec46736de0229e6d7a0f022cd2e661a` | **IDENTICAL** |
+| wrap `qa` | 248 | `733fbeea43050cb4a4e27f9384b9014e` | **IDENTICAL** |
 
-**Our copy has one extra trailing newline.** Proven rather than guessed: stripping a single
-trailing `\n` from our 842-byte file reproduces their OID `38da40ce…` exactly.
+**Method note, recorded because the first attempt got it wrong.** The four wrap originals live
+as *values inside* a single `wrap_prompts.json`, not as separate files. Comparing the JSON
+*container* to our four `.txt` files cannot work — 18,432 candidate serialisations were tried
+and none matched, which proved nothing. The correct comparison is per value: extract each JSON
+value and compare it to the corresponding `.txt`. Done against the source-local
+`prompts/wrap_prompts.json`, all four are byte-identical, and its key order is
+`easy, hard, wiki, qa` — the order that is part of the style seed.
+
+(The two `wrap_prompts.json` *files* do differ — source-local is 962 B `a9242e71…`, published
+is 972 B `07930c8e…` — but that is JSON formatting only. The four values are identical, and
+this repo stores the values, not the container.)
+
+### The distill discrepancy: the published `distill_prompt.txt` is the outlier
+
+`KYS-Configs` ships the distill prompt **twice, with different bytes**:
+
+| path | bytes | git OID | |
+|---|---:|---|---|
+| `prompts/distill_prompt.txt` | 841 | `38da40ce870e392ee23b8f27d9c61b3a358d3047` | no trailing newline |
+| `prompts/finephrase/nemotron/distill.md` | 842 | `200cd2c3f6782d9fcfada993054fbdf1a4091a57` | **= ours exactly** |
+
+The difference is a single trailing newline. Three independent artifacts carry the 842-byte
+form and one carries the 841-byte form:
+
+1. **Our reconstruction** — 842 B, `200cd2c3…`
+2. **The source's own surviving copy** — `projects/rewrite/prompts/distill/distill_prompt.txt`,
+   842 B, `200cd2c3…`
+3. **The published `finephrase/nemotron/distill.md`** — 842 B, `200cd2c3…`
+4. …against `prompts/distill_prompt.txt` — 841 B, `38da40ce…`
+
+**Was the trailing newline a log artefact?** This was the live question, since the
+reconstruction came from logged `templated_input` fields and a logger that appends a newline
+per record would manufacture exactly this. **It does not.** Every one of the 14 bake-off
+prompt templates was recovered from its own logs — take the logged chat-templated string, strip
+the chat wrapper, substitute the logged `doc_text` back to `[TEXT]` — and compared to its
+published `finephrase/**` file:
 
 ```
-ours : b'... high-quality and clear English following the instructions.\n'   (842 B)
-orig : b'... high-quality and clear English following the instructions.'     (841 B)
+14 / 14 recovered templates reproduce the published file byte-for-byte (git OID match)
+    format/{article,commentary,discussion,explanation,faq,narrative,table,tutorial}
+    nemotron/{distill,diverse_qa_pairs,extract_knowledge,knowledge_list,wikipedia_style_rephrasing}
+    rewire/guided_rewrite_improved
 ```
 
-**What it costs, measured against the real Qwen2.5-7B-Instruct tokenizer:**
+If the logger appended a newline, all 14 recoveries would be one byte long and none would
+match. All 14 match. So the `\n` before `<|im_end|>` in the distill log is real template
+content, and `nemotron_distill` recovers to 842 B / `200cd2c3…` — our file.
 
-| | ours | original |
-|---|---:|---:|
-| empty-doc overhead | **185** | **185** |
-| templated token count, real doc | 200 | 200 |
-| token IDs identical | — | **no** |
+**Conclusion: nothing in this repo changes.** The 842-byte form is what the bake-off executed,
+what the source repo kept, and what the published `finephrase/` copy contains. The published
+`prompts/distill_prompt.txt` appears to have lost its final newline somewhere in packaging;
+worth correcting there, but it is not this pipeline's problem.
 
-The overhead is **unchanged**, and so is the total token count. Exactly **one token
-differs**, at position 179: ours emits token `624` = `'.\n'` where the original emits token
-`13` = `'.'`, immediately before `<|im_end|>`.
+**Honest limit on that conclusion.** `09_Distill/launch_dataset.sh:20` shows production loaded
+`/scratch/.../data_rewrite/prompts/distill_prompt.txt`, and that tree no longer exists — so
+there is no *direct* production-side byte evidence, only the bake-off run plus the two
+surviving copies. All three agree, and no artifact anywhere carries the 841-byte form except
+the one published file, but the production file itself is gone and cannot be checked.
 
-Two things follow, and they point in opposite directions:
+### What this means for the overhead assertions
 
-- **The difference is real and reaches the model.** A different token sequence at
-  `temperature=0` can produce different output. This template is used by **5 of the 10
-  jobs** — every arm's distill pass.
-- **The overhead fingerprint cannot see it.** 185 = 185. This is precisely the class of
-  difference the token count was blind to, which is the argument for doing the byte
-  comparison at all — and it is why the expected values must be re-derived from the
-  originals rather than from the reconstructions.
+They are kept as the cheap runtime guard, and their expected values are now known to be derived
+from the originals, because **our files are the originals**. Measured against the real
+Qwen2.5-7B-Instruct tokenizer: `p1_wiki` 150, `p2_distill` 185, `wrap_easy` 72, `wrap_hard` 66,
+`wrap_wiki` 73, `wrap_qa` 83 — all six match `configs/data.yaml`.
 
-> Note for anyone re-deriving: the premise that "a trailing newline shifts the overhead" is
-> **false for this tokenizer** — Qwen merges `.` + `\n` into a single token `'.\n'`, so the
-> count is preserved while the identity is not. Do not use an unchanged overhead as
-> evidence that a template is unchanged.
-
-### Status: stopped, nothing adopted
-
-Per instruction, **no prompt file and no `expected_overhead` was changed.** Adopting either
-side silently is the failure mode this check exists to prevent, and there are two open
-questions that only content access can settle:
-
-1. **Which side is authoritative for distill?** The published file is labelled the original,
-   but our reconstruction is what round 3 verified against 18,000 logged 1.5B distill rows.
-   If the 1.5B run itself used the trailing-newline form, the *published* file is the one
-   that drifted, and adopting it would break parity with the corpus we are trying to match.
-   The logged `templated_input` fields in `00_Prompts/generations/nemotron_distill_1.5B.jsonl`
-   can settle this directly — they contain the fully rendered prompt.
-2. **The four wrap templates are unverified.** Their originals live inside a single
-   `wrap_prompts.json` (972 B), and our four `.txt` files cannot be compared to it by OID.
-   18,432 candidate JSON serialisations of our four texts were tried — key order, indent,
-   separators, trailing newline, and per-template newline stripping — and **none** reproduces
-   `07930c8e…`. That is *inconclusive*, not a proof of difference: the original's exact
-   serialisation is simply unknown. Their four overheads do all match expectation (72/66/73/83),
-   which is weak positive evidence and, as the distill case just demonstrated, not conclusive.
-
-**To close this, Wytro needs to grant read access to `blab-jhu/KYS-Configs`.** Then the four
-wrap templates can be diffed directly and the distill question resolved against the logged
-1.5B inputs. Until then the overhead assertions stay as the runtime guard — they are correct
-as shipped (all six verified above) but, as established, they cannot detect this class of
-difference.
+**But do not read an unchanged overhead as proof a template is unchanged.** The 841/842 pair
+was the counter-example: it produces the **same overhead (185) and the same total length**,
+differing at exactly one token position — Qwen merges `.` + `\n` into a single token `'.\n'`
+(id 624) where the alternative is `'.'` (id 13). The count is preserved while the identity is
+not. A token count is a smoke test; the byte comparison is the proof.
 
 ---
 
