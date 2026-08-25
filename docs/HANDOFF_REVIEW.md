@@ -1076,3 +1076,238 @@ Very little, and only in degree.
 Everything else — that the generation core is already multi-node safe, that `os.mkdir` is
 the right primitive, that `worker_id` does not determine which shards get processed, that
 shard size interacts with the fingerprint and must be fixed before job 1 — was accurate.
+
+---
+
+# Addendum — 2026-08-25: round 4, realignment to the changed design
+
+Round 4 was not a review round. The experiment design changed after rounds 1–3 were built,
+so parts of this package were wrong rather than merely improvable. The per-item record is
+below; the standalone write-up, including everything I established from the three sources
+and every place the round-4 brief was mistaken, is **`docs/DESIGN_DELTA.md`**. Read that
+first. This section is only the disposition list.
+
+Earlier sections of this file are unchanged and remain accurate as history — including
+§C1, whose recommendation this round reverses on instruction.
+
+## §1 wrap-inspired: one style per document — RESTORED
+
+**Disposition: done. This reverses round 2 §C1, on explicit instruction.**
+
+`assign_wrap_styles` is back, verbatim from `07_rewrite/rewrite_worker.py:54-62`, as
+`src/rewrite/wrap_styles.py`. `wrap-inspired` is now **2 jobs**: one styled pass that picks
+one of `easy`/`hard`/`wiki`/`qa` per document via
+`np.random.default_rng([42, shard_index])`, plus the shared distill pass.
+
+Four things about this that are worth stating plainly:
+
+1. **The job arithmetic is not "4 − 2".** wrap loses three style passes *and gains a
+   distill pass it never had*. This package's `wrap-inspired` had no `p2` at all, which
+   §C1 above acknowledged and which the round-4 brief did not mention. 2+2+2+2+2 = **10**.
+2. **The prompts were correct.** The brief flagged a worst case where
+   `prompts/wrap-inspired/p1..p4` might be the abandoned paper-verbatim set — a
+   corpus-wide silent corruption. They are not: all four are byte-identical (md5-verified)
+   to the production `easy/hard/wiki/qa` files. The abandoned set is identifiable by its
+   `medium` key and appears nowhere in production. The files are now named
+   `style_{easy,hard,wiki,qa}.txt` so job identity and style identity cannot be confused.
+3. **The style is recorded**, as an 11th output key `wrap_style`, present in every row of
+   every job (empty outside the styled pass) so the ten output sets share one schema. The
+   source added the column only in wrap mode; a ragged schema across jobs was not worth
+   the ~15 bytes/row saved.
+4. **Seed determinism survives resume, and this is tested rather than asserted.**
+   `tests/test_wrap_styles.py` (33 checks) covers: a golden vector pinned against
+   `np.random.default_rng([42, i])` so a numpy PCG64 change is caught; identical output
+   from two separate interpreter processes; a short draw being a prefix of a long one; the
+   signature taking no worker id at all; and 25.0% ± 0.1pp balance over 4M draws and over
+   2,000 shards. `tests/test_integration.py` adds the end-to-end property: every wrap row's
+   style equals `assign_wrap_styles(shard_index, n_rows)`, and **a deleted shard
+   regenerates with an identical style vector**.
+
+**One thing I did not preserve, and could not.** Shards here are re-cut at 5,000 rows, so
+`shard_index` is ours, not the source's. The assignment is reproducible *within this
+pipeline*; it is not the same draw the 1.5B run made. Different corpus, different sharding
+— the mechanism is preserved, not the specific values. Stated in the module docstring and
+in DESIGN_DELTA §2 rather than left for someone to discover.
+
+## §2 Only the remainder is rewritten — CONFIRMED, and stronger than reported
+
+**Disposition: done.**
+
+Each block upstream is a shared raw 20B core plus a block-specific remainder, and only the
+remainder is rewritten (`02_select/select_600m.py:213-233`). On the Hub the split is
+physical: each block folder holds the remainder only
+(`upload_blocks.py:222`, `keep = pc.equal(tbl['is_core'], want_core)`) and the core ships
+once as `shared-core/`. The core is provably identical across the five carrying blocks
+(sha256, `select_600m.py:631-637`), which is what makes "rewriting it per arm would be
+5× redundant" a fact rather than a guess.
+
+`configs/data.yaml` now states the GPU/no-GPU split in its header, and every arm carries
+`docs` and `source_tokens_llama2`, so a reader can see which tokens cost GPU time without
+opening a Python file.
+
+**Per your decision:** `quality-base` and `shared-core` are dropped as *arms* — comment-only
+accounting, not config entries — so preflight and the manifest ignore them and nothing
+downloads 20B raw tokens for no reason. The unfillable `quality-base` `repo_id` is deleted.
+`manifests/data_manifest.json` records both under `raw_not_rewritten` so the accounting is
+still machine-readable.
+
+**Correction to the brief:** the 80B and 140B per-block figures it quoted are block
+*totals*, not source budgets. The real remainders are 60B (×4) and 120B for rewire —
+κ=2 applies to the remainder, not the total (`select_600m.py:19-20,81`). Treating them as
+rewrite budgets would have overstated the GPU workload by 33% and 17%.
+
+## §3 Data access layer — one gated repo — DONE
+
+**Disposition: done, with two Hub-side findings the brief did not contain.**
+
+`hf.repo_id` + `hf.revision` (pinned to sha `6e18cda6…`) + a per-arm `subdir`. Downloads
+use `allow_patterns` so each arm pulls only its own folder rather than all 662 GB.
+
+1. **The repo is `gated: "manual"`.** Listing works unauthenticated; fetching bytes does
+   not. That failure mode surfaces late and on worker nodes, so `preflight` check 7 now
+   *downloads a real file* to prove read access and names Wytro as the person who must
+   clear it. This is the most likely day-zero blocker.
+2. **The card declares no `configs:` block**, so the Hub auto-converter exposes one
+   `default`/`train` config globbing every folder. `load_dataset(repo_id)` would silently
+   concatenate `shared-core` into all five arms. The loader therefore addresses folders by
+   explicit `data_files` glob and never by config name. A ready-made `configs:` block
+   exists at `data_reports/DATASET_CARD_DRAFT.md` and should be pushed, but nothing here
+   depends on it.
+
+**doc_id.** int64, globally unique across the 600M corpus, stable across blocks. Unique
+*within* an arm (which is all the row-conservation proof needs); not unique across arms,
+since remainders are drawn from one pool by different criteria. The output rows already
+key on `(doc_id, arm, prompt_id)`, so nothing needed changing. **Per your instruction, no
+cross-arm disjointness check was added here** — it belongs upstream at `02_select` where
+the id arrays are local; a pairwise numpy intersection there is seconds, whereas doing it
+here would mean re-downloading ~300M ids to learn something the selection stage already
+knows.
+
+**Pre-existing defect found and fixed:** `compute_fingerprint` folded `shard_target_rows`,
+`shard_target_bytes` and `DOC_ID_POLICY` but **not `require_doc_id`** — yet flipping that
+flag switches `doc_id` between the dataset column and a synthesized index, renumbering
+every row, while leaving the fingerprint identical. A resume across that flip would have
+matched `.done` markers written against different doc_ids. `doc_id_source` is now folded in.
+
+## §4 Every derived number recomputed — DONE
+
+**Disposition: done. Measured, not assumed.**
+
+**Compression ratio.** The brief said the 1.5B outputs "have both input and output token
+counts recorded". The row-level parquets that had both **are deleted** — `data_rewrite/`
+no longer exists. Two survivors were used: the exact arm-level census in
+`07_rewrite/progress/*.json` + `09_Distill/progress/*.json`, and the seeded ~36k-row
+sampled monitors, which do carry per-row `status`.
+
+Per-prompt `r` in llama-2 tokens, census-exact:
+
+| arm | r (pass 1) | r (distill) | sum | independently quoted |
+|---|---:|---:|---:|---:|
+| quality-first | 0.3399 | 0.2581 | 0.5981 | 0.598 |
+| diversity-oriented | 0.3812 | 0.2845 | 0.6657 | 0.666 |
+| disagreement-aware | 0.3649 | 0.2750 | 0.6400 | 0.640 |
+| wrap-inspired | 0.4313 | 0.3657 | 0.7970 | 0.797 |
+| rewire-inspired | 0.4628 | 0.3660 | 0.8288 | 0.829 |
+
+The right column is `select_600m.py:114-123`'s own recorded yields, computed by someone
+else from the same run. All five match to three decimals, which is what convinced me the
+denominator was right. On the `status == 2` restriction you asked for: it moves these by
+<3% and, in this denominator, truncation biases *upward* not downward — status-1 is
+0.02–0.33% of documents and contributes a maxed-out 4,096-token output. Both figures are
+in DESIGN_DELTA §5.
+
+**What moved:**
+
+| number | was | is |
+|---|---|---|
+| output tokens | `est_output_tokens_per_arm: 100e9` × 5 = 500B | per-arm; **261.49B** total (old figure overstated by **1.91×**) |
+| disk | hardcoded "~2.4 TB / ~0.7 TB" | derived from config; **1.125 TiB / 0.338 TiB** |
+| `shard_target_rows` | 2000 | **5000** |
+| row envelope | 220 B | 235 B (the `wrap_style` key) |
+
+The per-arm spread is 35.9B–99.5B — 2.8× — so the scalar was not merely wrong in magnitude,
+it was the wrong shape. The disk figure is now computed in one place and quoted from there.
+`06_calibrate.py` takes token *volume* from the per-arm measured estimates and uses the
+measured rate for *speed only*, which is what it actually measures; it also cross-checks
+the two and flags a >2× disagreement.
+
+**`shard_target_rows`.** Round 3's 2000 was derived against a smallest arm of 5.6M docs,
+where 10,000 rows would have failed the 20:1 guard. The smallest remainder is now 33.4M
+docs, so every candidate passes and the binding constraint became filesystem metadata load
+instead. 2000 would create 147,955 input shards and ~592k output files (63,241 shards for
+`rewire-inspired` alone); 5000 gives 59,184 and ~237k, still 67:1 at 100 GPUs with a ~6 min
+tail. It stays an explicit constant, not derived from `num_gpus`, for the round-3 reason
+that still holds.
+
+## §5 One-button run — updated, nothing weakened
+
+**Disposition: done.**
+
+`GUIDE_FOR_TIANJIAN.md` §1 is rewritten: 10 jobs, the real per-arm budgets, the half+half
+explanation, the new disk figures, and an explicit "you are only rewriting half the corpus"
+note so a missing sixth arm reads as intentional. §2.5 now explains the gating.
+
+**Placeholders.** Six WYTRO blanks became one. The five arm `repo_id`s collapse into a
+single `hf.repo_id` + pinned `revision`, both resolved from `upload_blocks.py:67` and
+confirmed against the Hub; `quality-base`'s is deleted. Still outstanding:
+`upload.repo_template` and `HF_TOKEN_WRITE` (both Wytro, both upload-only), plus **one new
+item: granting Tianjian's HF account access to the gated dataset.**
+
+Preflight gained a check and lost none. The gated-repo check is a new hard gate, and I
+deliberately made it fetch a file rather than read metadata, because metadata succeeds
+without access.
+
+## §6 A claim in this package's own docs that was wrong
+
+`docs/POSTPROCESSING.md` said the source's wrap trim "dispatched per row on a `wrap_style`
+column", and that claim had been used to justify dropping the column. **It is false.**
+`01_strip_prefix_wrap.py:185-188` applies the identical rule to all four styles and
+branches only on `distill` vs `rewritten` — which is job-level and already modelled here.
+`wrap_style` grouped the *statistics*, not the logic.
+
+Corrected in place, and the real behaviour is now reproduced: `trim_job` emits a
+`by_wrap_style` block with per-style doc share, token share and tokens/doc. The trim rule
+is untouched and still matches the source byte-for-byte over 72,443 comparisons.
+
+I mention it because it is the same failure mode this whole round exists to fix — a
+plausible-sounding claim about the source, written down once, then used as grounds to
+delete something.
+
+## §7 What was and was not executed
+
+**Ran, green:**
+
+| harness | result |
+|---|---|
+| `tests/test_wrap_styles.py` | 33/33 — golden vector, cross-process determinism, resume prefix, balance, config wiring |
+| `tests/test_integration.py` | all checks pass — 10 jobs, wrap 2 jobs, 11-key rows, per-row style match, deleted-shard regeneration identical |
+| `tests/test_trim_parity.py --source-root …` | 72,443 comparisons, **0 mismatches** (unchanged by the per-style stats) |
+| `tests/test_shuffle_parity.py --source-root …` | 63,000 rows byte-identical, unchanged |
+| `scripts/check_placeholders.py` | 11 TIANJIAN + 1 WYTRO remaining, as expected |
+
+**Not run, and why:** `scripts/preflight.py` end to end and
+`scripts/verify_prompt_parity.py` both need a real Qwen2.5-7B-Instruct tokenizer and filled
+cluster paths; neither exists here. The overhead constants they check (150 / 185 /
+72 / 66 / 73 / 83) are unchanged from round 3, which verified them, and the code paths that
+consume them are exercised by the integration test against a stubbed tokenizer. **No GPU
+work of any kind was run this round.**
+
+**Untouched, per instruction:** engine args, sampling params, the trim rules themselves,
+shuffle, claiming, reaping, the Blackwell-only constraint, `min_shards_per_gpu`.
+
+## §8 Open questions
+
+1. **The ReWire top-half filter is not implemented.** `rewire-inspired` gets κ=2 (120B
+   rather than 60B) specifically to buy headroom for a post-rewrite fastText filter — at
+   1.5B: 20.0B source → 16.22B rewritten → cutoff 0.11456 → 5.0B kept
+   (`_step3`/`_step4_rewrite_summary.json`). This package has no such stage, so that arm
+   ships **~99.5B tokens unfiltered**. Per your decision this is out of scope for round 4
+   and flagged rather than built. *Owner: Wytro, downstream. Blocks the run: no. Blocks
+   rewire's training mix: yes.*
+2. **doc_id overlap between arms is unmeasured** — expected and harmless here, but nobody
+   has quantified it. Upstream job, as agreed.
+3. **`quality-base` has no home.** 50B tokens, 37.3M documents, local-only. Whoever builds
+   the final training mixes needs it; nothing in `rewrite-vllm` produces or moves it.
+4. **`gpu_memory_utilization` is genuinely ambiguous in the source** — `0.90` in
+   `07_rewrite/README.md:21` and the argparse default, `0.85` in the sbatch that actually
+   ran. Unchanged here; flagged only so nobody later "fixes" it by citing the README.

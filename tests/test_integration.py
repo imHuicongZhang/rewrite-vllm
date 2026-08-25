@@ -1,7 +1,7 @@
 """End-to-end integration test with vLLM and the tokenizers stubbed out.
 
 Self-contained: no GPU, no model download, no network, no source pipeline, no filled
-placeholders. It builds a synthetic corpus, drives all 12 jobs across several workers, and
+placeholders. It builds a synthetic corpus, drives all 10 jobs across several workers, and
 asserts the invariants that matter -- above all that every prompt rewrites its arm's corpus
 in full.
 
@@ -25,9 +25,9 @@ shutil.copytree(REPO / "prompts", CFG_ROOT / "prompts")
 (CFG_ROOT / "manifests").mkdir(parents=True, exist_ok=True)
 
 NGPU = 3
-ARMS = ["quality-base", "quality-first", "diversity-oriented",
+ARMS = ["quality-first", "diversity-oriented",
         "disagreement-aware", "wrap-inspired", "rewire-inspired"]
-ROWS = {"quality-base": 500, "quality-first": 1234, "diversity-oriented": 900,
+ROWS = {"quality-first": 1234, "diversity-oriented": 900,
         "disagreement-aware": 700, "wrap-inspired": 1500, "rewire-inspired": 640}
 
 # ---- fill the configs ----
@@ -43,8 +43,10 @@ c["env"]["activate_cmd"] = "true"
 
 d = yaml.safe_load((CFG_ROOT / "configs/data.yaml").read_text())
 d["upload"]["repo_template"] = "testorg/rewrite-{arm}-{prompt_id}"
+# The fixture corpora are tiny, so the declared docs counts cannot apply; the row-count
+# cross-check is exercised separately below.
 for a in d["arms"]:
-    a["repo_id"] = f"testorg/{a['name']}"
+    a["docs"] = ROWS[a["name"]]
 d["sharding"]["shard_target_rows"] = 10      # tiny shards -> many of them
 d["sharding"]["shard_target_bytes"] = 1 << 20
 d["shuffle"]["rows_per_shard"] = 137         # force the carry-buffer path
@@ -94,7 +96,13 @@ E.count_llama2 = lambda ltok, texts: [max(0, len(t)//4) for t in texts]
 
 # Overheads differ under the fake tokenizer; relax the parity gate for the stub only.
 _real_overhead = E.empty_doc_overhead
-E.empty_doc_overhead = lambda qtok, cfg, prompt: prompt.expected_overhead
+# The parity gate measures a real tokenizer; this test has a fake one. Stub it to return
+# whatever the config expects, so the gate passes and the REST of the worker is exercised.
+# check_overheads() must be stubbed too, since it is what run_worker actually calls and it
+# is the thing that fans out over wrap-inspired's four styles.
+E.empty_doc_overhead = lambda qtok, cfg, mode, text: 0
+E.check_overheads = lambda qtok, cfg, prompt: [
+    (label, expected, expected) for label, text, expected in prompt.overheads()]
 
 class FakeOut:
     def __init__(self, text, fr): self.text=text; self.finish_reason=fr; self.token_ids=list(range(max(1,len(text)//4)))
@@ -123,18 +131,32 @@ def expect(cond, msg):
 hdr("1. config load + validation")
 cfg = C.load_config(CFG_ROOT)
 jobs = C.enumerate_jobs(cfg)
-expect(len(jobs)==12, f"12 jobs enumerated (got {len(jobs)})")
+expect(len(jobs)==10, f"10 jobs enumerated (got {len(jobs)})")
 expect([j.job_id for j in jobs if j.arm=="wrap-inspired"]==
-       ["wrap-inspired__p1","wrap-inspired__p2","wrap-inspired__p3","wrap-inspired__p4"],
-       "wrap-inspired has 4 jobs = 4 full passes")
-expect(not any(j.arm=="quality-base" for j in jobs), "quality-base produces NO jobs (control)")
+       ["wrap-inspired__p1","wrap-inspired__p2"],
+       "wrap-inspired has 2 jobs: ONE styled pass + the shared distill pass")
+wj = next(j for j in jobs if j.job_id=="wrap-inspired__p1")
+expect(wj.prompt.mode=="wrap_multi", "wrap-inspired p1 is mode wrap_multi")
+expect([st.style for st in wj.prompt.styles]==["easy","hard","wiki","qa"],
+       "wrap styled pass carries easy/hard/wiki/qa IN SEED ORDER")
+expect([st.expected_overhead for st in wj.prompt.styles]==[72,66,73,83],
+       "the four style overheads are 72/66/73/83")
+expect(len({st.text for st in wj.prompt.styles})==4, "the four style prompts are distinct")
+wd = next(j for j in jobs if j.job_id=="wrap-inspired__p2")
+expect(wd.prompt.trim=="distill" and wd.prompt.text==
+       (CFG_ROOT/"prompts/quality-first/p2.txt").read_text(),
+       "wrap-inspired p2 is byte-identical to the shared distill prompt")
+expect(not any(a.name=="quality-base" for a in cfg.arms),
+       "quality-base is not an arm (raw control, never uploaded)")
+expect(not any(a.name=="shared-core" for a in cfg.arms),
+       "shared-core is not an arm (raw half, 0 GPU tokens, not downloaded)")
 wiki = next(j for j in jobs if j.job_id=="quality-first__p1")
 dist = next(j for j in jobs if j.job_id=="quality-first__p2")
 expect(C.resolve_drop_threshold(wiki.prompt, cfg.max_model_len, cfg.max_tokens)==(30720,False),
        "wiki drop threshold = 30720 (fixed)")
 expect(C.resolve_drop_threshold(dist.prompt, cfg.max_model_len, cfg.max_tokens)==(28672,True),
        "distill drop threshold = 28672 (derived)")
-expect([j.prompt.trim for j in jobs].count("wrap")==4, "4 jobs use the wrap trim rule")
+expect([j.prompt.trim for j in jobs].count("wrap")==1, "exactly 1 job uses the wrap trim rule")
 expect(sorted({j.prompt.trim for j in jobs})==["distill","wiki","wrap"], "3 distinct trim rules")
 
 # reject a forbidden engine arg
@@ -159,16 +181,16 @@ D.write_data_manifest(cfg, log=lambda m: None)
 for a in ARMS:
     m = D.load_manifest(cfg, a)
     expect(m.total_rows==ROWS[a], f"{a}: manifest rows {m.total_rows} == {ROWS[a]}")
-qb = D.load_manifest(cfg, "quality-base")
-expect(qb.rewrite is False and not list(cfg.shards_dir('quality-base').glob('part_*.parquet')),
-       "quality-base verified + counted but NO shards written (control)")
-expect(qb.content_sha1 and qb.total_text_bytes>0, "quality-base has a content hash + byte count")
 dm = json.loads((CFG_ROOT/"manifests/data_manifest.json").read_text())
-expect(dm["total_rewrite_jobs"]==12, "data_manifest records 12 rewrite jobs")
-expect(dm["arms"]["quality-base"]["rewrite"] is False, "data_manifest flags quality-base rewrite:false")
+expect(dm["total_rewrite_jobs"]==10, "data_manifest records 10 rewrite jobs")
+expect(set(dm["raw_not_rewritten"])=={"shared-core","quality-base"},
+       "data_manifest records the raw half that is never rewritten")
+expect(dm["raw_not_rewritten"]["shared-core"]["tokens_llama2"]==20000010702
+       and dm["raw_not_rewritten"]["quality-base"]["tokens_llama2"]==50000002028,
+       "raw-half token accounting is 20.0B core + 50.0B quality-base")
 
 # ================================================================= 3. run all 12
-hdr("3. run all 12 jobs across %d workers" % NGPU)
+hdr("3. run all 10 jobs across %d workers" % NGPU)
 from rewrite import run_rewrite as RR
 import threading, time as _t
 # Heterogeneous fleet simulation: worker 0 is "slow" (H200), workers 1-2 "fast" (B200/B300).
@@ -213,14 +235,56 @@ for arm in ["wrap-inspired","quality-first"]:
 p0 = sorted((cfg.raw_dir("quality-first","p1")).glob(f"part_*{cfg.shard_suffix}"))[0]
 rows0 = [r for r in D.iter_jsonl(p0)]
 n_s0 = sum(1 for r in rows0 if r["status"]==0)
-expect(all(set(r)=={"doc_id","arm","prompt_id","source_text_sha1","rewritten_text",
-                    "finish_reason","n_prompt_tokens","n_output_tokens","status",
-                    "n_output_tokens_llama2"} for r in rows0), "output rows have exactly the 10 keys")
+KEYS11 = {"doc_id","arm","prompt_id","source_text_sha1","rewritten_text",
+          "finish_reason","n_prompt_tokens","n_output_tokens","status",
+          "n_output_tokens_llama2","wrap_style"}
+expect(all(set(r)==KEYS11 for r in rows0), "output rows have exactly the 11 keys")
+expect(set(cfg.data["output"]["keys"])==KEYS11,
+       "configs/data.yaml output.keys matches what is actually written")
+expect(all(r["wrap_style"]=="" for r in rows0),
+       "wrap_style is the empty string for a non-wrap job")
 expect(all(r["rewritten_text"]=="" and r["n_output_tokens"]==0 and r["finish_reason"]==""
            for r in rows0 if r["status"]==0), f"status-0 rows emitted empty ({n_s0} in shard 0)")
 st_all = {s for r in rows0 for s in [r["status"]]}
 expect(1 in {r["status"] for f in sorted(cfg.raw_dir("quality-first","p1").glob(f"part_*{cfg.shard_suffix}")) for r in D.iter_jsonl(f)},
        "status=1 (finish_reason='length') is produced and recorded")
+
+# ---- wrap-inspired's styled pass: the style really reaches the output rows ----
+from rewrite.wrap_styles import assign_wrap_styles as _aws, WRAP_STYLES as _WS
+_wrap_rows, _wrap_ok = [], True
+for _f in sorted(cfg.raw_dir("wrap-inspired","p1").glob(f"part_*{cfg.shard_suffix}")):
+    _m = D.SHARD_RE.search(_f.name.replace(cfg.shard_suffix, ".parquet"))
+    _si = int(_m.group(1))
+    _rs = list(D.iter_jsonl(_f))
+    _wrap_rows += _rs
+    # THE property: the style written to disk is exactly what the seeded function gives
+    # for this shard index -- not merely a plausible value.
+    if [r["wrap_style"] for r in _rs] != _aws(_si, len(_rs)):
+        _wrap_ok = False
+expect(_wrap_ok, "every wrap row's style == assign_wrap_styles(shard_index, n_rows)")
+expect(all(r["wrap_style"] in _WS for r in _wrap_rows),
+       "every wrap row carries one of easy/hard/wiki/qa")
+_wc = {st: sum(1 for r in _wrap_rows if r["wrap_style"]==st) for st in _WS}
+expect(sum(_wc.values())==len(_wrap_rows) and min(_wc.values())>0,
+       f"all four styles present across the corpus {_wc}")
+# the distill pass of the SAME arm must NOT carry a style
+_dr = [r for f in sorted(cfg.raw_dir("wrap-inspired","p2").glob(f"part_*{cfg.shard_suffix}"))
+       for r in D.iter_jsonl(f)]
+expect(_dr and all(r["wrap_style"]=="" for r in _dr),
+       "wrap-inspired's distill pass carries no style (it is the shared grounded prompt)")
+
+# ---- resume determinism, end to end: delete a shard, regenerate, same styles ----
+_f0 = sorted(cfg.raw_dir("wrap-inspired","p1").glob(f"part_*{cfg.shard_suffix}"))[0]
+_m0 = D.SHARD_RE.search(_f0.name.replace(cfg.shard_suffix, ".parquet"))
+_si0 = int(_m0.group(1))
+_before = [r["wrap_style"] for r in D.iter_jsonl(_f0)]
+_f0.unlink(); D.sidecar_path(_f0).unlink()
+_wj = next(j for j in jobs if j.job_id=="wrap-inspired__p1")
+RR.run_worker(cfg, _wj, 0, 1)
+_after = [r["wrap_style"] for r in D.iter_jsonl(_f0)]
+expect(_before == _after and len(_before) > 0,
+       f"a deleted wrap shard regenerates with IDENTICAL styles (shard {_si0}, "
+       f"{len(_before)} rows)")
 
 # ================================================================= 4. resume
 hdr("4. resume behaviour")
@@ -514,14 +578,26 @@ expect("progress_{HOST}_w{worker_id}.json" in (REPO / "src" / "rewrite" / "run_r
 _shipped = yaml.safe_load((REPO / "configs" / "data.yaml").read_text())["sharding"]
 rows_per_shard = _shipped["shard_target_rows"]
 min_ratio = _shipped["min_shards_per_gpu"]
-expect(rows_per_shard == 2000,
+expect(rows_per_shard == 5000,
        f"2: shipped shard_target_rows is sized for ~100 GPUs ({rows_per_shard})")
-for arm_docs, label in ((5_602_476, "smallest source arm"),):
+# Recomputed in round 4 against the REAL remainder sizes. The smallest arm is now
+# disagreement-aware at 33,381,230 docs -- 6x the old smallest -- so every candidate
+# clears the guard and the binding constraint became filesystem metadata load instead.
+_declared = {a["name"]: a["docs"] for a in
+             yaml.safe_load((REPO / "configs" / "data.yaml").read_text())["arms"]}
+_smallest = min(_declared.values())
+expect(_smallest == 33_381_230,
+       f"2: smallest arm is disagreement-aware at {_smallest:,} docs")
+for arm_docs, label in ((_smallest, "smallest arm"),):
     shards = -(-arm_docs // rows_per_shard)
     expect(shards >= min_ratio * 100,
            f"2: {label} gives {shards:,} shards >= {min_ratio*100:,} needed at 100 GPUs")
-    expect(-(-arm_docs // 10_000) < min_ratio * 100,
-           f"2: the OLD default of 10,000 rows would have refused to start at 100 GPUs")
+# Total file pressure is the reason 5000 was chosen over 2000: 2000 would create ~592k
+# output files across the 10 jobs.
+_total_shards = sum(-(-d // rows_per_shard) for d in _declared.values())
+expect(_total_shards < 70_000,
+       f"2: {_total_shards:,} input shards across all arms (2000 rows would give "
+       f"{sum(-(-d // 2000) for d in _declared.values()):,})")
 
 # §3: doc_id provenance is recorded per arm, and the requirement is enforced
 for a in ARMS:

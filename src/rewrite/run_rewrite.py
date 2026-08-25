@@ -7,16 +7,19 @@ there is NO `if pass == "distill"` branch anywhere below.
 
 THE SEMANTIC THAT IS EASY TO GET WRONG
 --------------------------------------
-Each prompt rewrites the ENTIRE dataset for its arm. Prompts are not partitioned across
-documents, not sampled per document, not round-robined. `wrap-inspired` with 4 prompts
-means 4 COMPLETE PASSES over the whole corpus, producing 4 output shard sets.
-The shard list for a job is the arm's complete shard list, with no prompt-dependent
-filtering anywhere, and the row-conservation assertion at step 9 below fails the job if
-that ever stops being true.
+Each prompt covers EVERY document of its arm exactly once. Prompts are not partitioned
+across documents, not sampled, not round-robined. The shard list for a job is the arm's
+complete shard list, with no prompt-dependent filtering anywhere, and the row-conservation
+assertion at step 9 below fails the job if that ever stops being true.
 
-(The source did something different for wrap: it assigned ONE of four styles per document
-via np.random.default_rng([42, shard_index]) -- a single pass, not four. That code is
-deliberately deleted rather than disabled; see docs/HANDOFF_REVIEW.md.)
+`wrap-inspired`'s styled pass (p1) is ONE job that still covers every document exactly
+once -- but the prompt it uses is chosen PER DOCUMENT from four styles, by
+np.random.default_rng([42, shard_index]), exactly as the source did it. That is full
+coverage without being a cross product. The chosen style is recorded per row in the
+`wrap_style` output column, or it would be unrecoverable afterwards.
+
+Rounds 1-3 modelled wrap as four complete passes and deleted the style RNG; round 4
+restored it because that design was superseded. See docs/DESIGN_DELTA.md section 2.
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ import time
 from pathlib import Path
 
 from . import data as D
+from .wrap_styles import WRAP_STYLES, assign_wrap_styles
 from .config import (Config, JobSpec, enumerate_jobs, get_job, load_config,
                      resolve_drop_threshold, stop)
 
@@ -82,19 +86,29 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
     # ---- PARITY GATE ----------------------------------------------------------
     # One integer that proves prompt file + chat template + tokenizer are the source's.
     # source printed exactly this line: 09_Distill/logs/ds_diversity-first_1591082_0.out
-    overhead = E.empty_doc_overhead(qtok, cfg, job.prompt)
-    raw_budget = cfg.max_model_len - cfg.max_tokens - overhead
-    log(f"[w{worker_id}] OVERHEAD(empty-doc templated tokens)={overhead} "
-        f"raw_text_budget={raw_budget} drop_threshold={drop_threshold} "
-        f"(={'derived max_model_len-max_tokens' if derived else 'fixed'})")
-    if overhead != job.prompt.expected_overhead:
+    # wrap-inspired's styled pass emits four different prompt texts, so it has four
+    # overheads and every one is checked. A silent mismatch on one style would corrupt a
+    # quarter of that arm's corpus.
+    measured = E.check_overheads(qtok, cfg, job.prompt)
+    for label, got, want in measured:
+        raw_budget = cfg.max_model_len - cfg.max_tokens - got
+        log(f"[w{worker_id}] OVERHEAD(empty-doc templated tokens)[{label}]={got} "
+            f"raw_text_budget={raw_budget} drop_threshold={drop_threshold} "
+            f"(={'derived max_model_len-max_tokens' if derived else 'fixed'})")
+    bad = [(lbl, got, want) for lbl, got, want in measured if got != want]
+    if bad:
+        detail = "\n".join(f"    {lbl}: measured {got}, expected {want}"
+                            for lbl, got, want in bad)
         stop(
-            f"{job.job_id}: empty-document templated overhead is {overhead}, expected "
-            f"{job.prompt.expected_overhead}.\n"
+            f"{job.job_id}: empty-document templated overhead does not match for "
+            f"{len(bad)} of {len(measured)} prompt text(s).\n{detail}\n"
             "  The prompt file, the chat template, or the tokenizer differs from the "
             "source pipeline. Every token count downstream would diverge.\n"
             "  Do NOT edit the expected value to make this pass -- find out what changed."
         )
+    # For the sidecar: one number for a grounded job, or the four styles rendered.
+    overhead = (measured[0][1] if len(measured) == 1
+                else {lbl.split(":", 1)[-1]: got for lbl, got, _ in measured})
 
     all_shards = D.shard_paths(cfg, job.arm)
     if len(all_shards) != man.n_shards:
@@ -234,8 +248,15 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
         # Hold a liveness signal on the claim for the whole shard. The main thread is
         # blocked inside llm.generate(), so a background tick is the only way another node
         # can distinguish "still working" from "died holding this".
+        # ONE style per document for wrap-inspired's styled pass, keyed on (42, si) only,
+        # so any worker that picks up shard si -- first time or after a crash -- assigns
+        # the identical styles. See src/rewrite/wrap_styles.py.
+        styles = (assign_wrap_styles(si, n_rows)
+                  if job.prompt.mode == "wrap_multi" else None)
+
         with D.ClaimHeartbeat(job.output_dir, si, interval=min(60.0, stale_after / 5)):
-            prep = E.prepare_batch(qtok, cfg, texts, job.prompt, drop_threshold)
+            prep = E.prepare_batch(qtok, cfg, texts, job.prompt, drop_threshold,
+                                   styles=styles)
             res = E.run_batch(llm, prep)
             n_llama = [0] * n_rows
             if prep.keep_idx:
@@ -257,6 +278,9 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
                 "n_output_tokens": res.n_output_tokens[j],
                 "status": res.status[j],
                 "n_output_tokens_llama2": n_llama[j],
+                # The style this document drew. Empty for the nine non-wrap jobs; without
+                # it the assignment is unrecoverable after the fact.
+                "wrap_style": styles[j] if styles is not None else "",
             }, ensure_ascii=False))
 
         # ---- ROW CONSERVATION: the guarantee is created here ----
@@ -290,6 +314,11 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
             "n_output_tokens_llama2": sum_l2,
             "bytes": out_path.stat().st_size, "elapsed_s": round(dt, 2),
             "drop_threshold": drop_threshold, "prompt_overhead": overhead,
+            # Per-style document counts for this shard. Lets the 25/25/25/25 balance be
+            # audited without reading the data back, and makes an accidental re-seed
+            # visible immediately.
+            "wrap_style_counts": ({st: styles.count(st) for st in WRAP_STYLES}
+                                  if styles is not None else None),
             # WHICH GPU produced these rows. On a mixed H200/B200/B300 fleet the attention
             # backend and reduction order differ by architecture, so greedy output can
             # differ slightly between cards. Recording it here is the only way to

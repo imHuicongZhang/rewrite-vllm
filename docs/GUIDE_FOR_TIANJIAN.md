@@ -8,31 +8,43 @@ should need inferring. Secondary reader: Tianjian, skimming.
 ## 1. Thirty-second summary
 
 This repo rewrites five web-text corpora with **Qwen2.5-7B-Instruct** under **vLLM**, then
-trims and shuffles the results. A sixth corpus, `quality-base`, is a **control**: it is
-downloaded and verified so the token accounting is complete, and is **never rewritten**.
+trims and shuffles the results.
 
-**12 rewrite jobs.** One job = one (arm, prompt) pair:
+**10 rewrite jobs.** One job = one (arm, prompt) pair. Every arm gets two passes:
 
-| arm | prompts | jobs |
-|---|---|---|
-| `quality-base` | 0 | 0 — control, download + verify only |
-| `quality-first` | 2 | 2 |
-| `diversity-oriented` | 2 | 2 |
-| `disagreement-aware` | 2 | 2 |
-| `wrap-inspired` | 4 | 4 |
-| `rewire-inspired` | 2 | 2 |
-| | | **12** |
+| arm | source tokens | documents | pass 1 | pass 2 | jobs |
+|---|---:|---:|---|---|---|
+| `quality-first` | 60.0 B | 37,511,431 | wiki | distill | 2 |
+| `diversity-oriented` | 60.0 B | 35,304,301 | wiki | distill | 2 |
+| `disagreement-aware` | 60.0 B | 33,381,230 | wiki | distill | 2 |
+| `wrap-inspired` | 60.0 B | 63,226,477 | **styled** | distill | 2 |
+| `rewire-inspired` | 120.0 B | 126,480,544 | wiki | distill | 2 |
+| | **360.0 B** | **295,903,983** | | | **10** |
 
-**The thing that is easiest to get wrong:** each prompt rewrites the **entire** dataset
-for its arm. Prompts are not split across documents, not sampled per document, not
-round-robined. `wrap-inspired` with 4 prompts means **4 complete passes over the whole
-corpus**, producing 4 output shard sets. The code asserts this (output rows per
-(arm, prompt) must equal the arm's input rows) and fails the job if it is ever violated.
+**The thing that is easiest to get wrong:** each prompt covers **every** document of its
+arm, exactly once. Prompts are not split across documents, not sampled, not round-robined.
+The code asserts this — output rows per (arm, prompt) must equal the arm's input rows —
+and fails the job if it is ever violated.
 
-**Scale.** ~500B input tokens; roughly 100B output tokens per arm, ~500–550B total. Order
-of **2.4 TB** of JSONL uncompressed, ~0.7 TB with the default zstd. Wall-clock depends
-entirely on your GPUs — `preflight.py` prints a per-GPU KV-cache estimate and every job
-logs a live tok/s and ETA. Assume days-to-weeks, and assume **it will be interrupted many
+`wrap-inspired`'s pass 1 is the one special case, and it is still full coverage: it
+rewrites every document once, but picks one of **four styles per document**
+(`easy`/`hard`/`wiki`/`qa`) using a seeded RNG, and records which one in the `wrap_style`
+output column. You do not have to do anything about this — it is automatic and
+reproducible across restarts — but do not be surprised to see four different prompts in
+one job's log.
+
+**You are only rewriting half the corpus.** Each block upstream is a shared raw 20B "core"
+plus a block-specific remainder, and only the remainder is rewritten. The core, and a
+separate 50B `quality-base` control block, never touch a GPU and are **not downloaded by
+this repo at all**. The 360 B above is the remainder total — the part that is actually
+yours to process. Full explanation: `docs/DESIGN_DELTA.md`.
+
+**Scale.** 360 B source tokens × 2 passes = **720 B input tokens** through the GPUs,
+producing **~261 B output tokens** (measured, not assumed — see `docs/DESIGN_DELTA.md`
+§5). That is roughly **1.1 TiB** of JSONL uncompressed, **~0.34 TiB** with the default
+zstd. Wall-clock depends entirely on your GPUs — `preflight.py` prints a per-GPU KV-cache
+estimate, `06_calibrate.py` projects the whole run from a measured rate, and every job logs
+a live tok/s and ETA. Assume days-to-weeks, and assume **it will be interrupted many
 times**. That is fine: everything resumes at shard granularity. Re-running the same
 command is always the correct recovery action.
 
@@ -44,6 +56,10 @@ orchestration has roles and one of them must run on a single node.
 
 **What you must supply:** eleven values in `configs/cluster.yaml` and one token in `.env`.
 That is all. Section 2 lists every one.
+
+**What Wytro must supply before you can start:** access to the gated input dataset (see
+`HF_TOKEN` in §2.5) and the output repo template. If `preflight.py` stops on either, it is
+not something you can fix on your side.
 
 ---
 
@@ -70,7 +86,7 @@ are expanded automatically, so `"${repo_root}/logs"` is a valid value.
 | `repo_root` | absolute path to this clone | `cd` into the repo, run `pwd` |
 | `model_dir` | where model weights land, ~20 GB | any disk with room: `df -h <dir>` |
 | `data_root` | downloaded + re-sharded inputs | needs roughly 2× the raw dataset size; `preflight.py` prints the real number |
-| `out_root` | rewritten output — **the big one** | ~0.7 TB with zstd, ~2.4 TB without |
+| `out_root` | rewritten output — **the big one** | ~0.34 TiB with zstd, ~1.1 TiB without |
 | `tmp_root` | shuffle scratch | must be **fast local** disk, not NFS/Lustre; ~1.2× the largest single job's output |
 | `log_root` | per-worker logs | small; `"${repo_root}/logs"` is fine |
 | `hf_cache` | `HF_HOME` | **not** your home directory if it has a quota — downloads will fill it |
@@ -93,7 +109,7 @@ nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv
 
 ### 2.3 GPU architecture — this run is Blackwell only
 
-**All 12 jobs run on B200 (`sm_100`) and B300 / Blackwell Ultra (`sm_103`). H200 is
+**All 10 jobs run on B200 (`sm_100`) and B300 / Blackwell Ultra (`sm_103`). H200 is
 excluded, even if it is present on the node.** This is Wytro's experimental design, and it
 is enforced in code: `configs/data.yaml` carries `compute_constraints.allowed_gpu_arch`,
 `preflight.py` refuses to start on a disallowed card, and **every worker refuses on its
@@ -128,7 +144,7 @@ stays auditable. Two consequences:
 
 * **Do not delete the `.done` sidecars.** They are the resume markers *and* the record of
   which card produced which rows.
-* **Do not change `compute.gpu_ids` partway through the 12 jobs.** Jobs are sequential and
+* **Do not change `compute.gpu_ids` partway through the 10 jobs.** Jobs are sequential and
   each uses every GPU, so a fixed set means every arm sees the same hardware mixture.
   Changing it midway is what would actually bias the comparison.
 
@@ -155,7 +171,7 @@ cp .env.example .env
 
 | variable | what |
 |---|---|
-| `HF_TOKEN` | your HuggingFace token with **read** access to the six input datasets. Create at <https://huggingface.co/settings/tokens>. |
+| `HF_TOKEN` | your HuggingFace token with **read** access to `wytro/Know-Your-Sources-7B`. Create at <https://huggingface.co/settings/tokens>.<br>**That dataset is GATED.** Having a valid token is not enough — the account behind it must have been *granted access* by Wytro. Listing the repo works without access; downloading does not, so this fails late unless checked. `preflight.py` check 7 fetches a real file to prove it. If it reports a 401/403 or the word `gated`, stop and ask Wytro to approve your account; do not work around it. |
 | `HF_TOKEN_WRITE` | a token with **write** scope on the output org (Wytro's blank; may be the same token). |
 
 `.env` is gitignored. **Never commit it, never paste a token into a config file or a
@@ -178,7 +194,7 @@ python3 scripts/check_placeholders.py     # must exit 0
 #    Ends with an 8-document end-to-end smoke test; READ ITS BEFORE/AFTER OUTPUT.
 python scripts/preflight.py
 
-# 4. The whole run: model -> data -> calibrate -> 12 jobs -> postprocess -> upload.
+# 4. The whole run: model -> data -> calibrate -> 10 jobs -> postprocess -> upload.
 #    Calibration measures real throughput and projects total wall clock BEFORE job 1.
 #    Read that projection: a wrong number is worth noticing on day zero, not day six.
 #    On several nodes, see section 3.5 instead of this line.
@@ -218,11 +234,11 @@ be **node-local** (it holds shuffle buckets). `compute.num_gpus` is per node.
 **Three roles, in order.**
 
 ```bash
-# 1. ONCE, on one node. Downloads the model and the six datasets, shards them, and stops.
+# 1. ONCE, on one node. Downloads the model and the five arm folders, shards them, and stops.
 bash scripts/run_all.sh --prepare-only
 
 # 2. On EVERY node, at the same time. Generates; does not postprocess or upload.
-#    Each node works the 12 jobs in the same order and claims whatever is free.
+#    Each node works the 10 jobs in the same order and claims whatever is free.
 bash scripts/run_all.sh --generate-only
 
 # 3. ONCE, on one node, AFTER every node in step 2 has exited.
@@ -256,7 +272,7 @@ time; it only removes claims that have gone quiet.
 
 Agent: **do not decide these yourself.** Stop, ask, and wait.
 
-1. **Where the data goes.** `out_root` needs up to ~2.4 TB and `data_root` a comparable
+1. **Where the data goes.** `out_root` needs up to ~1.1 TiB and `data_root` a comparable
    amount. Do not pick a filesystem, quota, or scratch area on his behalf, and do not
    "free up space" by deleting anything.
 2. **How many GPUs to take.** `num_gpus` decides how much of the machine this consumes,
@@ -292,11 +308,11 @@ Agent: **do not decide these yourself.** Stop, ask, and wait.
 | **`sidecar fingerprint does not match the manifest`** | The input was re-sharded after some output was generated, so `doc_id`s were renumbered. | Do not delete anything yet. This normally means `sharding.*` in `data.yaml` was changed, or `data_root` was rebuilt. Ask Wytro. The safe fix is to restore the original sharding; the expensive fix is regenerating that job. |
 | **`overhead is N, expected M`** | The prompt file, chat template, or tokenizer differs from the original pipeline. | **Do not edit `expected_overhead` to make it pass.** That integer is the proof the prompt is byte-correct. Check that no prompt file was modified (`git status`), and that the model revision resolved to the same chat template. Then ask. |
 | **Model download keeps restarting** | Interrupted transfers. | It is idempotent — re-run `python scripts/01_download_model.py`. Once complete it verifies locally and never touches the network again (`--offline` forces that). |
-| **`this torch build has NO kernels for sm_XXX`** | The pinned torch build cannot run one of your cards. | **Stop.** Do not install a different torch or vLLM — a different build changes generation behaviour and destroys comparability across the arms. Report the exact line to Wytro; re-pinning the whole stack so all 12 jobs share one build is the only correct fix. |
+| **`this torch build has NO kernels for sm_XXX`** | The pinned torch build cannot run one of your cards. | **Stop.** Do not install a different torch or vLLM — a different build changes generation behaviour and destroys comparability across the arms. Report the exact line to Wytro; re-pinning the whole stack so all 10 jobs share one build is the only correct fix. |
 | **`no exact sm_XXX kernels ... will PTX-JIT`** | Your card runs, but through JIT-compiled PTX rather than tuned kernels. | Not an error. Expect a slow first few minutes while it compiles, then normal speed. Watch the first job's `tok/s`; if it stays far below the other cards, tell Wytro. |
 | **One GPU finishes long before the others** | Heterogeneous fleet with `shard_assignment: static`. | Set `shard_assignment: dynamic` in `cluster.yaml` and re-run. Safe at any point — it only changes which worker takes which shard, never what is generated. Finished shards are skipped. |
 | **A shard is stuck; no worker picks it up** | A `part_NNNNN.claim` directory left by a run that was killed. | The launcher clears these automatically on every start, so just re-run `03_run_job.sh`. To do it by hand: `python -m rewrite.run_rewrite --arm A --prompt-id pN --reap-claims`. **Never run that while workers are live** — it would let two workers take the same shard. |
-| **`only N shards for M GPUs`** at data prep | `sharding.shard_target_rows` is too large for your GPU count. At 100 GPUs the previous default of 10,000 rows failed this for most arms. | The error computes the value to use. Set it in `configs/data.yaml`, delete that arm's shard directory, re-run. **Do this before job 1** — shard size feeds the manifest fingerprint, so changing it later invalidates every `.done` marker. |
+| **`only N shards for M GPUs`** at data prep | `sharding.shard_target_rows` is too large for your GPU count. At the shipped 5,000 rows the smallest arm gives 6,677 shards — 67:1 at 100 GPUs — so this should not fire. If it does, either you have far more GPUs than planned or an arm downloaded short. | The error computes the value to use. Set it in `configs/data.yaml`, delete that arm's shard directory, re-run. **Do this before job 1** — shard size feeds the manifest fingerprint, so changing it later invalidates every `.done` marker. |
 | **`dataset has NO 'doc_id' column`** | An input dataset does not carry the join key. | Ask Wytro to add a `doc_id` column and re-upload; it costs nothing at upload time and makes the key durable. Only if that is impossible, set `sharding.require_doc_id: false` — the pipeline then synthesizes a row index, which works but ties the join to `data_root/shards/` surviving forever. |
 | **A shard seems stuck, owned by a node that died** | Its claim is no longer heartbeated. | Wait: another node takes it over after `claim_stale_after_s` (30 min). To hurry it, re-run the job on any node. Do **not** use `--reap-claims --force` while other nodes are working. |
 | **Two nodes both say "already running"** | The per-node lock doing its job — one launch per node per job. | Correct behaviour. Different nodes running the same job concurrently is how multi-node works; the same node twice is not. |
@@ -321,12 +337,16 @@ A hard list. Each item exists because doing it silently invalidates the experime
    outputs. It looks quirky in places; that is the point.
 4. **Do not shuffle across arms**, or across prompts within an arm. Shuffling is scoped to
    one (arm, prompt) and the code enforces it.
-5. **Do not skip `quality-base`.** It is never rewritten, but it must be downloaded and
-   verified so the token accounting is complete.
+5. **Do not try to download `quality-base` or `shared-core`.** They are the raw half of
+   the corpus: never rewritten, so this repo does not fetch them and there is no arm for
+   them. `quality-base` is not on the Hub at all. Their token accounting is recorded in
+   the header of `configs/data.yaml` and in `manifests/data_manifest.json` under
+   `raw_not_rewritten`. If you think a sixth arm is missing, it is not — read
+   `docs/DESIGN_DELTA.md` §3.
 6. **Do not "fix" a version mismatch by installing a different vLLM/torch/transformers.**
    A different build produces different text at `temperature=0`, and afterwards there is
    no way to tell which rows came from which build. Stop and ask instead.
-7. **Do not change `compute.gpu_ids` or `num_gpus` partway through the 12 jobs.** On a
+7. **Do not change `compute.gpu_ids` or `num_gpus` partway through the 10 jobs.** On a
    mixed-architecture fleet that confounds "which arm" with "which GPU" and quietly biases
    the comparison the whole experiment exists to make. Decide the GPU set once, before job
    1, and keep it.

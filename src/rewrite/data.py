@@ -83,9 +83,9 @@ def sha1_text(s) -> str:
 @dataclass
 class Manifest:
     arm: str
-    repo_id: str
+    repo_id: str        # the single gated repo
+    subdir: str         # this arm's folder inside it
     revision: str
-    rewrite: bool
     fingerprint: str
     total_rows: int
     total_text_bytes: int
@@ -126,15 +126,22 @@ def input_rows(cfg: Config, arm: str) -> int:
     return load_manifest(cfg, arm).total_rows
 
 
-def compute_fingerprint(cfg: Config, content_sha1: str) -> str:
+def compute_fingerprint(cfg: Config, content_sha1: str, doc_id_source: str) -> str:
     """Interlock against re-sharding under a finished run.
 
     Re-sharding renumbers doc_id and silently invalidates every .done marker downstream,
     so the fingerprint folds in the sharding parameters as well as the content.
+
+    `doc_id_source` is folded in as of round 4. It had been left out, which was a hole:
+    flipping sharding.require_doc_id switches doc_id between the dataset's own column and
+    a synthesized row index -- i.e. it renumbers every row -- yet produced an identical
+    fingerprint, so a resume across that flip would have silently matched .done markers
+    written against different doc_ids. The rule is that the fingerprint covers everything
+    that would renumber rows.
     """
     sh = cfg.data["sharding"]
     blob = "|".join([content_sha1, str(sh["shard_target_rows"]),
-                     str(sh["shard_target_bytes"]), DOC_ID_POLICY])
+                     str(sh["shard_target_bytes"]), DOC_ID_POLICY, doc_id_source])
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
 
@@ -393,20 +400,38 @@ def _hf_kwargs(cfg: Config, write: bool = False):
 
 
 def download_arm(cfg: Config, arm_name: str, log=print) -> None:
-    """Snapshot the dataset repo into the HF cache. Idempotent and resumable."""
+    """Snapshot ONE arm's folder out of the single gated repo. Idempotent and resumable.
+
+    allow_patterns restricts the transfer to this arm's subdirectory. Without it every arm
+    would pull all 662 GB of the repo -- including shared-core and the four other arms --
+    five times over.
+    """
     from huggingface_hub import snapshot_download
     a = cfg.arm(arm_name)
-    log(f"[data] {a.name}: snapshot_download({a.repo_id}, revision={a.revision})")
-    snapshot_download(repo_id=a.repo_id, repo_type="dataset", revision=a.revision,
+    pattern = f"{a.subdir}/*"
+    log(f"[data] {a.name}: snapshot_download({cfg.hf_repo_id}, "
+        f"revision={cfg.hf_revision[:12]}, allow_patterns={pattern!r})")
+    snapshot_download(repo_id=cfg.hf_repo_id, repo_type="dataset",
+                      revision=cfg.hf_revision, allow_patterns=[pattern],
                       cache_dir=str(cfg.paths["hf_cache"]), **_hf_kwargs(cfg))
     log(f"[data] {a.name}: download complete")
 
 
 def _open_dataset(cfg: Config, a, streaming: bool = False):
+    """Open ONE arm by explicit data_files glob.
+
+    NOT by HF config name: the Hub card declares no `configs:` block, so the auto-converter
+    exposes a single config `default`/`train` globbing every folder in the repo. Passing
+    the bare repo id here would silently concatenate shared-core and all five arms, and the
+    row-conservation proof would then be checked against the wrong denominator.
+    See docs/DESIGN_DELTA.md section 4.
+    """
     from datasets import load_dataset
-    return load_dataset(a.repo_id, revision=a.revision, split="train",
-                        streaming=streaming, cache_dir=str(cfg.paths["hf_cache"]),
-                        **_hf_kwargs(cfg))
+    return load_dataset("parquet",
+                        data_files={"train": f"hf://datasets/{cfg.hf_repo_id}@"
+                                             f"{cfg.hf_revision}/{cfg.hf_data_files(a.name)}"},
+                        split="train", streaming=streaming,
+                        cache_dir=str(cfg.paths["hf_cache"]), **_hf_kwargs(cfg))
 
 
 def probe_arm(cfg: Config, arm_name: str, log=print) -> dict:
@@ -416,9 +441,9 @@ def probe_arm(cfg: Config, arm_name: str, log=print) -> dict:
     ds = _open_dataset(cfg, a, streaming=True)
     row = next(iter(ds), None)
     if row is None:
-        stop(f"{a.name}: dataset {a.repo_id} appears to be empty")
+        stop(f"{a.name}: {cfg.hf_repo_id}/{a.subdir} appears to be empty")
     if col not in row:
-        stop(f"{a.name}: dataset {a.repo_id} has no {col!r} column; "
+        stop(f"{a.name}: {cfg.hf_repo_id}/{a.subdir} has no {col!r} column; "
              f"columns are {sorted(row)}")
     if not isinstance(row[col], str):
         stop(f"{a.name}: column {col!r} is {type(row[col]).__name__}, expected str")
@@ -493,10 +518,10 @@ def shard_arm(cfg: Config, arm_name: str, log=print, count_tokens: bool = False)
     has_doc_id = "doc_id" in ds.column_names
     require = bool(sh.get("require_doc_id", True))
     if not has_doc_id:
-        msg = (f"{a.name}: dataset {a.repo_id} has NO 'doc_id' column "
+        msg = (f"{a.name}: {cfg.hf_repo_id}/{a.subdir} has NO 'doc_id' column "
                f"(columns: {ds.column_names}).\n"
                f"  doc_id is the key that joins rewritten output back to the input corpus "
-               f"-- topic labels, quality scores, anything not carried in the 10-key output "
+               f"-- topic labels, quality scores, anything not carried in the 11-key output "
                f"schema.\n"
                f"  Without it this pipeline synthesizes a row index, which is deterministic "
                f"but only meaningful relative to this sharding: data_root/shards/ then has "
@@ -527,21 +552,19 @@ def shard_arm(cfg: Config, arm_name: str, log=print, count_tokens: bool = False)
         nonlocal shard_idx, buf_ids, buf_txt, buf_sha, buf_bytes
         if not buf_txt:
             return
-        if a.rewrite:
-            tbl = pa.table({
-                "doc_id": pa.array(buf_ids, type=pa.int64()),
-                col: pa.array(buf_txt, type=pa.large_string()),
-                "source_text_sha1": pa.array(buf_sha, type=pa.string()),
-            })
-            atomic_write_table(tbl, out_dir / f"part_{shard_idx:05d}.parquet")
+        tbl = pa.table({
+            "doc_id": pa.array(buf_ids, type=pa.int64()),
+            col: pa.array(buf_txt, type=pa.large_string()),
+            "source_text_sha1": pa.array(buf_sha, type=pa.string()),
+        })
+        atomic_write_table(tbl, out_dir / f"part_{shard_idx:05d}.parquet")
         shards.append({"index": shard_idx, "path": f"part_{shard_idx:05d}.parquet",
                        "n_rows": len(buf_txt), "text_bytes": buf_bytes})
         shard_idx += 1
         buf_ids, buf_txt, buf_sha, buf_bytes = [], [], [], 0
 
     log(f"[data] {a.name}: sharding "
-        f"(target {target_rows:,} rows / {target_bytes/2**20:.0f} MiB per shard)"
-        + ("" if a.rewrite else "  [CONTROL ARM: verify + count only, no shards written]"))
+        f"(target {target_rows:,} rows / {target_bytes/2**20:.0f} MiB per shard)")
 
     for batch in ds.select_columns(
             [c for c in (col, "doc_id") if c in ds.column_names]).iter(batch_size=1000):
@@ -568,23 +591,36 @@ def shard_arm(cfg: Config, arm_name: str, log=print, count_tokens: bool = False)
     flush()
 
     content_sha1 = running.hexdigest()
+    doc_id_source = "dataset" if has_doc_id else "synthesized"
     man = Manifest(
-        arm=a.name, repo_id=a.repo_id, revision=a.revision, rewrite=a.rewrite,
-        fingerprint=compute_fingerprint(cfg, content_sha1),
+        arm=a.name, repo_id=cfg.hf_repo_id, subdir=a.subdir, revision=cfg.hf_revision,
+        fingerprint=compute_fingerprint(cfg, content_sha1, doc_id_source),
         total_rows=total_rows, total_text_bytes=total_bytes, content_sha1=content_sha1,
         n_shards=len(shards), shards=shards,
         total_tokens_llama2=(total_tok if count_tokens else None),
-        doc_id_source=("dataset" if has_doc_id else "synthesized"),
+        doc_id_source=doc_id_source,
     )
 
-    if a.rewrite:
+    # Cross-check against the count data.yaml declares. A mismatch means the pinned
+    # revision is not the data these estimates were computed from -- which would make every
+    # disk and wall-clock number in the run wrong, silently.
+    if a.docs and total_rows != a.docs:
+        stop(f"{a.name}: downloaded {total_rows:,} rows but configs/data.yaml declares "
+             f"docs: {a.docs:,}.\n"
+             f"  Either hf.revision ({cfg.hf_revision[:12]}) is not the revision those "
+             f"numbers came from, or the arm's `docs` is stale.\n"
+             f"  Every token, disk and wall-clock estimate in this run derives from "
+             f"`docs` and `source_tokens_llama2`, so this is not a warning.")
+
+    if True:
         min_ratio = int(sh["min_shards_per_gpu"])
         need = min_ratio * cfg.num_gpus
         if man.n_shards < need:
-            # Do the arithmetic here rather than leaving it to be discovered. At 100 GPUs
-            # the shipped default of 10,000 rows/shard fails this for most arms, and the
-            # useful output is the number to use, not the fact that the current one is
-            # wrong.
+            # Do the arithmetic here rather than leaving it to be discovered: the useful
+            # output is the number to use, not the fact that the current one is wrong.
+            # At the shipped 5,000 rows/shard the smallest arm gives 6,677 shards, 67:1 at
+            # 100 GPUs, so this should not fire -- if it does, either num_gpus is far
+            # larger than planned or an arm is much smaller than data.yaml declares.
             suggested = max(200, (total_rows // need) // 100 * 100)
             stop(
                 f"{a.name}: only {man.n_shards} shards for {cfg.num_gpus} GPUs "
@@ -618,15 +654,29 @@ def write_data_manifest(cfg: Config, log=print) -> Path:
     for a in cfg.arms:
         man = load_manifest(cfg, a.name)
         out["arms"][a.name] = {
-            "repo_id": man.repo_id, "revision": man.revision, "rewrite": man.rewrite,
+            "repo_id": man.repo_id, "subdir": man.subdir, "revision": man.revision,
             "total_rows": man.total_rows, "total_text_bytes": man.total_text_bytes,
             "content_sha1": man.content_sha1, "fingerprint": man.fingerprint,
             "n_shards": man.n_shards, "doc_id_source": man.doc_id_source,
             "total_tokens_llama2": man.total_tokens_llama2,
+            "declared_docs": a.docs,
+            "source_tokens_llama2": a.source_tokens_llama2,
             "n_prompts": len(a.prompts),
-            "n_rewrite_jobs": len(a.prompts) if a.rewrite else 0,
+            "n_rewrite_jobs": len(a.prompts),
+            "est_output_tokens": sum(pr.est_output_tokens for pr in a.prompts),
         }
     out["total_rewrite_jobs"] = sum(v["n_rewrite_jobs"] for v in out["arms"].values())
+    # The raw half of the corpus, recorded so the token accounting in this file is complete
+    # even though neither block is downloaded or rewritten. See docs/DESIGN_DELTA.md s3.
+    out["raw_not_rewritten"] = {
+        "shared-core": {"docs": 17909083, "tokens_llama2": 20000010702,
+                        "note": "raw half carried into training by all five arms; "
+                                "on the Hub at <repo>/shared-core, joined back on doc_id"},
+        "quality-base": {"docs": 37298288, "tokens_llama2": 50000002028,
+                         "note": "raw-text control; never rewritten and never uploaded"},
+    }
+    out["est_output_tokens_total"] = cfg.est_output_tokens_total
+    out["source_tokens_llama2_total"] = sum(a.source_tokens_llama2 for a in cfg.arms)
     p = cfg.repo_root / "manifests" / "data_manifest.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(json.dumps(out, indent=2), p)
@@ -789,5 +839,9 @@ def jsonl_to_table(path: Path, keys: list):
         "finish_reason": pa.large_string(), "n_prompt_tokens": pa.int32(),
         "n_output_tokens": pa.int32(), "status": pa.int8(),
         "n_output_tokens_llama2": pa.int32(),
+        # Present in every row of every job; the empty string outside wrap-inspired's
+        # styled pass. Source had it in wrap mode only, but a column that exists for one
+        # job and not the others makes the ten output sets non-uniform.
+        "wrap_style": pa.large_string(),
     }
     return pa.table({k: pa.array(v, type=types.get(k)) for k, v in cols.items()})

@@ -208,7 +208,8 @@ Note: several `06_vllm/` **ablation** scripts do set `repetition_penalty` (1.0/1
 
 There is no sampling seed and no engine seed in production (`seed=0` is vLLM's default, visible in
 the log). The only seeds in the source are `np.random.default_rng([42, shard_index])` for wrap-style
-assignment (dropped — see §7), `np.random.default_rng([7, worker_id])` for monitor sampling
+assignment (**restored in round 4** as `src/rewrite/wrap_styles.py`; it had been dropped in
+rounds 1–3 — see `docs/DESIGN_DELTA.md` §2), `np.random.default_rng([7, worker_id])` for monitor sampling
 (dropped), and `seed=42` in the bucketed shuffle (ported).
 
 ### 4.2 Drop thresholds — the per-prompt asymmetry
@@ -542,8 +543,13 @@ the Hub at runtime. Both are added here for the download path only.
 **HF repo IDs.** Exactly one appears in the whole source tree
 (`06_vllm/wrap_styles_sample.py:27`, `"Qwen/Qwen2.5-1.5B-Instruct"`, used only in a markdown
 header). There is no `push_to_hub`, no `HfApi`, and no dataset repo ID anywhere — every model and
-dataset was a local absolute path under `HF_HUB_OFFLINE=1`. This is why all six input repo IDs and
-all output repo names are `<<<WYTRO>>>` placeholders in `configs/data.yaml`.
+dataset was a local absolute path under `HF_HUB_OFFLINE=1`. This is why the input and output repo
+names started as `<<<WYTRO>>>` placeholders in `configs/data.yaml`.
+
+> **Round 4 update.** The input side is now resolved: the corpus was uploaded to the single gated
+> repo `wytro/Know-Your-Sources-7B` by `13_600M/02_select/upload_blocks.py:67`, and `data.yaml`
+> pins it by commit sha. Only `upload.repo_template` (the *output* org) remains a placeholder,
+> because nothing has been pushed there yet. See `docs/DESIGN_DELTA.md` §4.
 
 ---
 

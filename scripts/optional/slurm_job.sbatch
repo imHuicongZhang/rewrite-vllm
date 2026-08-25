@@ -50,6 +50,6 @@ cd "$REPO_ROOT"
 echo "[slurm] host=$(hostname) job=${SLURM_JOB_ID:-none} gpus=${CUDA_VISIBLE_DEVICES:-all}"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 
-# Everything else -- env activation, preflight, the 12 sequential jobs, postprocess,
+# Everything else -- env activation, preflight, the 10 sequential jobs, postprocess,
 # upload -- is exactly the bash path. Nothing scheduler-specific happens below.
 exec bash scripts/run_all.sh

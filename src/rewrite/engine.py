@@ -81,6 +81,9 @@ def build_content(mode: str, doc_text, prompt_text: str) -> str:
     """The user-message content for one document, pre chat-template.
 
     source: 07_rewrite/rewrite_worker.py:45-51, verbatim.
+
+    For wrap_multi, `prompt_text` is the text of the style this particular document drew;
+    the concatenation itself is identical to the source's single wrap mode.
     """
     doc_text = doc_text or ""
     if mode == "grounded":
@@ -109,17 +112,30 @@ def count_qwen(qtok, finals: list) -> list:
     return [len(x) for x in qtok(finals, add_special_tokens=False).input_ids]
 
 
-def empty_doc_overhead(qtok, cfg: Config, prompt: PromptSpec) -> int:
-    """Templated token count with an EMPTY document.
+def empty_doc_overhead(qtok, cfg: Config, mode: str, prompt_text: str) -> int:
+    """Templated token count with an EMPTY document, for ONE prompt text.
 
     source: 09_Distill/rewrite_worker.py:231-237, which printed exactly this and logged
     `OVERHEAD(empty-doc templated tokens)=185` for the distill prompt.
 
     This single integer proves the prompt file, the chat template and the tokenizer are
     all the ones the source used. It is asserted before any GPU work begins.
+
+    wrap-inspired's styled pass carries four prompt texts in one job, so it has four of
+    these (72/66/73/83) and ALL FOUR are asserted -- see check_overheads().
     """
-    final = template(qtok, cfg, build_content(prompt.mode, "", prompt.text))
+    final = template(qtok, cfg, build_content(mode, "", prompt_text))
     return len(qtok(final, add_special_tokens=False).input_ids)
+
+
+def check_overheads(qtok, cfg: Config, prompt: PromptSpec) -> list:
+    """Measure the empty-document overhead of every prompt text this job can emit.
+
+    Returns [(label, measured, expected), ...] -- one entry for a grounded job, four for
+    wrap-inspired's styled pass. The caller decides how to fail; this only measures.
+    """
+    return [(label, empty_doc_overhead(qtok, cfg, prompt.mode, text), expected)
+            for label, text, expected in prompt.overheads()]
 
 
 # --------------------------------------------------------------------------- engine
@@ -171,17 +187,37 @@ class Prepared:
 
 
 def prepare_batch(qtok, cfg: Config, texts: list, prompt: PromptSpec,
-                  drop_threshold: int) -> Prepared:
+                  drop_threshold: int, styles: list | None = None) -> Prepared:
     """Build prompts and decide status=0 by templated length.
 
     source: 07_rewrite/rewrite_worker.py:279-296, transcribed.
 
     Documents are DROPPED, never truncated -- there is no document truncation anywhere in
-    the source. The decision is made on the real templated n_in, not by additivity.
+    the source. The decision is made on the real templated n_in, not by additivity. That
+    matters more for wrap_multi than it did before: the four styles have overheads of
+    66..83 tokens, so a document near the threshold can be kept under one style and
+    dropped under another. Measuring the real templated length per row handles that
+    without a special case.
+
+    `styles` is the per-row style name for mode wrap_multi, and must be None otherwise.
     """
     n_rows = len(texts)
-    finals = [template(qtok, cfg, build_content(prompt.mode, t, prompt.text))
-              for t in texts]
+    if prompt.mode == "wrap_multi":
+        if styles is None or len(styles) != n_rows:
+            stop(f"{prompt.arm}/{prompt.id}: mode wrap_multi needs one style per row "
+                 f"({n_rows} expected, got {0 if styles is None else len(styles)})")
+        by_style = {st.style: st.text for st in prompt.styles}
+        unknown = sorted(set(styles) - set(by_style))
+        if unknown:
+            stop(f"{prompt.arm}/{prompt.id}: unknown wrap style(s) {unknown}; "
+                 f"known: {sorted(by_style)}")
+        finals = [template(qtok, cfg, build_content(prompt.mode, t, by_style[sty]))
+                  for t, sty in zip(texts, styles)]
+    else:
+        if styles is not None:
+            stop(f"{prompt.arm}/{prompt.id}: styles passed for mode {prompt.mode!r}")
+        finals = [template(qtok, cfg, build_content(prompt.mode, t, prompt.text))
+                  for t in texts]
     n_in_list = count_qwen(qtok, finals)
 
     keep_idx, keep_prompts, keep_sp = [], [], []

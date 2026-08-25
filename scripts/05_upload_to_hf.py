@@ -58,36 +58,40 @@ def repo_name(cfg, job) -> str:
 
 
 WRAP_CAVEAT = """
-## Selection caveat — read before subsampling this arm
+## Style assignment — read before subsampling or stratifying this arm
 
-This arm was rewritten with **four prompts**, so its pool carries **four rewrites per
-source document**, where every other arm carries two (one wiki-style, one distill).
+Every document in this arm was rewritten **once**, with **one of four styles** chosen
+uniformly at random per document: `easy`, `hard`, `wiki`, `qa`. The style that each row
+actually received is in the **`wrap_style`** column. The choice is seeded on
+`(42, shard_index)` and is reproducible.
 
-At a fixed token budget that does **not** automatically mean more duplication. Under
-*uniform* subsampling to a budget `B`, expected copies per document is
-`n_passes x B / pool`, and since `pool ~ n_passes x tokens_per_pass`, that reduces to a
-quantity independent of the pass count — a larger pool is met with a smaller fraction of
-it. Worked at `B` = 5B tokens, using the originating run's measured figures:
+This arm is therefore **not** four rewrites per document. It is one styled rewrite plus
+the shared distill rewrite, exactly like every other arm's two passes.
 
-| arm | pool | fraction needed | expected copies/doc |
-|---|---:|---:|:--:|
-| quality-first | 5.98B | 84% | 1.67 |
-| wrap-inspired | 16.7B | 30% | **1.20** |
+### Documents are balanced across styles; tokens are not
 
-So under uniform sampling this arm ends up with *less* per-document duplication than
-quality-first, not more.
+Uniform *per-document* assignment does not give uniform *token* shares, because the four
+styles expand very differently. Measured on the originating 1.5B run:
 
-**Under quality-ranked selection this reverses.** A good document's four rewrites all
-score well together, so duplication concentrates on exactly the documents a
-quality-sorted budget spends itself on. The originating pipeline was already alert to
-this: for this arm specifically it supplemented with a seeded *random* draw rather than a
-quality sort, recorded in its own manifest as
-`"distill_selection": "seeded_random_seed42_no_quality_sort"`, to keep the arm comparable
+| style | doc share | token share | tokens/doc |
+|---|---:|---:|---:|
+| easy | 25.05% | 14.23% | 223 |
+| hard | 24.91% | 33.55% | 530 |
+| wiki | 25.03% | 23.16% | 364 |
+| qa | 25.02% | 29.05% | 457 |
+
+Documents land within 25.0% ± 0.1pp of uniform; token shares spread **2.37×**. The
+originating pipeline applied no correction, and neither did this one.
+
+The consequence for anyone cutting this arm to a token budget: **a uniform draw over
+tokens is not a uniform draw over styles.** It will over-represent `hard` and
+under-represent `easy` by roughly that 2.37× factor. If style balance matters for your
+use, stratify on `wrap_style` rather than sampling rows uniformly.
+
+The originating pipeline also drew this arm's distill supplement with a seeded *random*
+draw rather than a quality sort — recorded in its own manifest as
+`"distill_selection": "seeded_random_seed42_no_quality_sort"` — to keep the arm comparable
 with the others.
-
-If you are deciding how to cut this arm to a token budget: compute and report
-copies-per-document for every arm rather than assuming symmetry, and prefer a uniform or
-seeded-random draw over a quality sort unless you have a specific reason not to.
 """
 
 
@@ -138,6 +142,7 @@ Generated with `{cfg.vllm['model']['repo_id']}` under vLLM.
 | `status` | `0` dropped (too long, never generated) · `1` truncated at the output cap · `2` clean stop |
 | `n_prompt_tokens`, `n_output_tokens` | Qwen tokenizer |
 | `n_output_tokens_llama2` | Llama-2 tokenizer — **use this one for token budgeting**, and add 1 per document for BOS |
+| `wrap_style` | which of `easy`/`hard`/`wiki`/`qa` produced this row. Populated only for `wrap-inspired`'s styled pass; the empty string everywhere else |
 
 Rows with `status != 2` are present but were not cleanly generated. Filter to `status == 2`
 for training use; the others are retained so row counts match the input exactly.
@@ -223,7 +228,7 @@ def main(argv=None) -> int:
                    f"create_repo {name}")
 
         # Ship the card with the data. For wrap-inspired this is the only place the
-        # selection caveat reaches the person who will subsample it.
+        # style-assignment note reaches the person who will subsample it.
         card = dataset_card(cfg, job, len(files), nbytes)
         card_p = src / "README.md"
         D.atomic_write_text(card, card_p)
@@ -231,7 +236,7 @@ def main(argv=None) -> int:
             path_or_fileobj=str(card_p), path_in_repo="README.md",
             repo_id=name, repo_type="dataset",
             commit_message="dataset card"), f"upload card {name}")
-        print(f"    card uploaded" + ("  (includes the wrap selection caveat)"
+        print(f"    card uploaded" + ("  (includes the wrap style-assignment note)"
                                       if job.arm == "wrap-inspired" else ""))
         with_retry(lambda: api.upload_folder(
             repo_id=name, repo_type="dataset", folder_path=str(src),

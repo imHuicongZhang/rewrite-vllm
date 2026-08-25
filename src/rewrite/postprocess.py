@@ -219,6 +219,15 @@ class ShardStats:
     tok_before_s2: int = 0
     tok_after_s2: int = 0
     openings: dict = field(default_factory=dict)
+    # Per-wrap-style breakdown, for wrap-inspired's styled pass only; empty elsewhere.
+    #
+    # NOTE, because the repo previously said otherwise: the source did NOT dispatch a
+    # different trim RULE per style. 01_strip_prefix_wrap.py:185-188 applies
+    # strip_preamble + strip_instruction_leak to every style identically. `wrap_style` was
+    # used only to GROUP THE STATISTICS -- openings, status2 counts, stripped counts and
+    # token totals, reported per style (01_strip_prefix_wrap.py:151-152,164-181).
+    # That grouping is what is reproduced here. See docs/DESIGN_DELTA.md section 2.
+    by_style: dict = field(default_factory=dict)
 
 
 _TOK = None
@@ -255,25 +264,49 @@ def trim_shard(args) -> ShardStats:
     rows = list(D.iter_jsonl(in_path))
     st.n_rows = len(rows)
     openings = {}
+    by_style = {}
+
+    def _bucket(g):
+        # setdefault rather than a fixed key set, so an unexpected style value is bucketed
+        # safely instead of raising. source: 01_strip_prefix_wrap.py:176-178.
+        return by_style.setdefault(g, {"status2": 0, "stripped": 0,
+                                       "tok_before": 0, "tok_after": 0, "openings": {}})
 
     for r in rows:
         if r.get("status") != 2:          # ONLY status==2 rows are examined
             continue
         st.n_status2 += 1
-        st.tok_before_s2 += int(r.get("n_output_tokens_llama2") or 0)
+        tb = int(r.get("n_output_tokens_llama2") or 0)
+        st.tok_before_s2 += tb
         s = r.get("rewritten_text")
+        # "" for every job except wrap-inspired's styled pass.
+        g = r.get("wrap_style") or ""
+        b = _bucket(g) if g else None
+        if b is not None:
+            b["status2"] += 1
+            b["tok_before"] += tb
         if sample_openings:
             key = (s or "")[:80]
             openings[key] = openings.get(key, 0) + 1
-        new, did = rule(s)
+            if b is not None:
+                b["openings"][key] = b["openings"].get(key, 0) + 1
+        new, did = rule(s)                # SAME rule for every style -- see ShardStats
         if did:
             r["rewritten_text"] = new
             r["n_output_tokens_llama2"] = _n_llama(new)   # recount ONLY changed rows
             st.n_stripped += 1
-        st.tok_after_s2 += int(r.get("n_output_tokens_llama2") or 0)
+            if b is not None:
+                b["stripped"] += 1
+        ta = int(r.get("n_output_tokens_llama2") or 0)
+        st.tok_after_s2 += ta
+        if b is not None:
+            b["tok_after"] += ta
 
     if sample_openings:
         st.openings = dict(sorted(openings.items(), key=lambda kv: -kv[1])[:5])
+    for g, b in by_style.items():
+        b["openings"] = dict(sorted(b["openings"].items(), key=lambda kv: -kv[1])[:5])
+    st.by_style = by_style
 
     if st.n_stripped or in_path != out_path:
         tmp = Path(str(out_path) + ".tmp")
@@ -324,6 +357,7 @@ def trim_job(cfg: Config, job: JobSpec, workers: int | None = None, log=print) -
     agg = ShardStats()
     t0 = time.time()
     openings = {}
+    by_style = {}
     with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker,
                              initargs=(str(E.llama2_dir(cfg)),)) as ex:
         for i, st in enumerate(ex.map(trim_shard, tasks), 1):
@@ -334,6 +368,14 @@ def trim_job(cfg: Config, job: JobSpec, workers: int | None = None, log=print) -
             agg.tok_after_s2 += st.tok_after_s2
             for k, v in st.openings.items():
                 openings[k] = openings.get(k, 0) + v
+            for g, b in st.by_style.items():
+                tgt = by_style.setdefault(g, {"status2": 0, "stripped": 0,
+                                              "tok_before": 0, "tok_after": 0,
+                                              "openings": {}})
+                for k in ("status2", "stripped", "tok_before", "tok_after"):
+                    tgt[k] += b[k]
+                for k, v in b["openings"].items():
+                    tgt["openings"][k] = tgt["openings"].get(k, 0) + v
             if i % 50 == 0:
                 log(f"[trim] {job.job_id}: {i}/{len(shards)} shards "
                     f"({time.time()-t0:.0f}s)")
@@ -349,7 +391,22 @@ def trim_job(cfg: Config, job: JobSpec, workers: int | None = None, log=print) -
             sorted(openings.items(), key=lambda kv: -kv[1])[:5]),
         "elapsed_s": round(time.time() - t0, 1),
     }
+    if by_style:
+        for g, b in by_style.items():
+            b["openings"] = dict(sorted(b["openings"].items(),
+                                        key=lambda kv: -kv[1])[:5])
+            b["tok_per_doc"] = round(b["tok_after"] / b["status2"], 1) if b["status2"] else 0
+        tot = sum(b["status2"] for b in by_style.values()) or 1
+        tok = sum(b["tok_after"] for b in by_style.values()) or 1
+        for b in by_style.values():
+            b["doc_share_pct"] = round(100.0 * b["status2"] / tot, 3)
+            b["token_share_pct"] = round(100.0 * b["tok_after"] / tok, 3)
+        summary["by_wrap_style"] = {g: by_style[g] for g in sorted(by_style)}
     log(f"[trim] {job.job_id}: status2={agg.n_status2:,} stripped={agg.n_stripped:,} "
         f"({pct:.4f}%) tok_saved={summary['tok_saved']:,}")
+    for g, b in (summary.get("by_wrap_style") or {}).items():
+        log(f"[trim] {job.job_id}:   style {g:5s} docs={b['status2']:>12,} "
+            f"({b['doc_share_pct']:5.2f}%)  tokens {b['token_share_pct']:5.2f}%  "
+            f"{b['tok_per_doc']:.1f} tok/doc")
     D.atomic_write_text(json.dumps(summary, indent=2), marker)
     return summary

@@ -28,15 +28,37 @@ each prompt in `configs/data.yaml` rather than a branch in the code.
 | diversity-oriented | p1 / p2 | wiki / distill | `wiki` / `distill` | `01_strip_prefix_diversity.py` |
 | disagreement-aware | p1 / p2 | wiki / distill | `wiki` / `distill` | `01_strip_prefix.py` |
 | rewire-inspired | p1 / p2 | wiki / distill | `wiki` / `distill` | `01_strip_prefix_rewrite.py` |
-| wrap-inspired | p1–p4 | easy / hard / wiki / qa | `wrap` (all four) | `01_strip_prefix_wrap.py` |
+| wrap-inspired | p1 | easy / hard / wiki / qa, **one per document** | `wrap` | `01_strip_prefix_wrap.py` |
+| wrap-inspired | p2 | distill | `distill` | `01_strip_prefix_wrap.py` (subdir=distill) |
 
-Eight `wiki`/`distill` jobs plus four `wrap` jobs = 12.
+Nine `wiki`/`distill` jobs plus one `wrap` job = 10.
 
-One structural simplification the new semantics allow: the original `wrap` trim dispatched
-**per row** on a `wrap_style` column, because each document had been assigned one of four
-styles. Here each style is its own job, so the rule is uniform within a shard and
-`wrap_style` disappears — its information is now `prompt_id`. The rule function itself is
-unchanged; `strip_preamble` was already style-agnostic.
+### The `wrap` rule does not vary by style — and never did
+
+An earlier revision of this document said the original `wrap` trim "dispatched **per row**
+on a `wrap_style` column". **That was wrong**, and the claim was used to justify dropping
+the column. The source applies the *same* rule to every style —
+`01_strip_prefix_wrap.py:185-188`:
+
+```python
+if subdir == 'distill':                # distill: shared extended template rule
+    new, did = strip_distill_preamble(s)
+else:                                  # rewritten (wrap styles): wrap rule + leak
+    new, did = strip_preamble(s)
+    new, did_leak = strip_instruction_leak(new)
+    did = did or did_leak
+```
+
+The only dispatch is `distill` vs `rewritten`, which is job-level and is already modelled
+here as `trim: distill` vs `trim: wrap`. `strip_preamble` is style-agnostic, deliberately:
+its `qa`-safety comes from `STRICT_META`, not from knowing the row's style.
+
+What `wrap_style` *was* used for in the source is **grouping the statistics** —
+per-style openings, `status==2` counts, stripped counts and token totals
+(`01_strip_prefix_wrap.py:151-152,164-181`). That is reproduced here: `trim_job` emits a
+`by_wrap_style` block in its summary with per-style doc share, token share and tokens/doc,
+so the 25/25/25/25 document balance and the 2.37× *token* imbalance are both visible
+without reading the data back. See `docs/DESIGN_DELTA.md` section 2.
 
 ---
 

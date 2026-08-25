@@ -70,7 +70,7 @@ workers assert at runtime.
 
 ### `test_integration.py`
 
-Stubs vLLM and the tokenizers, builds a synthetic corpus, and drives all 12 jobs across
+Stubs vLLM and the tokenizers, builds a synthetic corpus, and drives all 10 jobs across
 several workers. Around 100 assertions covering: config validation and the engine/sampling
 whitelists; sharding and the manifest; row conservation per job, deep-verified by counting
 lines on disk; **every prompt covering its arm's entire corpus**; status-0 rows emitted

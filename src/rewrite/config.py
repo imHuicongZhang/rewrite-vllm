@@ -21,6 +21,11 @@ from pathlib import Path
 
 import yaml
 
+# The canonical style list and its ORDER live in wrap_styles.py, which also owns the seeded
+# assignment. Imported rather than duplicated: the order is part of the reproducible seed,
+# so two copies that could drift apart would be a silent corpus corruption.
+from .wrap_styles import WRAP_STYLES
+
 # Built by concatenation so this module never matches its own placeholder scan.
 _OPEN = "<" * 3
 _CLOSE = ">" * 3
@@ -36,7 +41,12 @@ ALLOWED_ENGINE_KEYS = {
     "max_model_len",
 }
 
-VALID_MODES = {"grounded", "wrap"}
+# grounded   -> one prompt, [TEXT] interpolated. Nine of the ten jobs.
+# wrap_multi -> ONE job carrying FOUR style prompts, one chosen per document by a seeded
+#               RNG (src/rewrite/wrap_styles.py). wrap-inspired's styled pass only.
+#               The old plain "wrap" mode -- one style per job, four jobs -- is gone with
+#               the four-pass design. See docs/DESIGN_DELTA.md section 2.
+VALID_MODES = {"grounded", "wrap_multi"}
 VALID_TRIMS = {"wiki", "distill", "wrap"}
 
 # The literal marker the grounded prompts interpolate the document into.
@@ -77,23 +87,57 @@ def load_env(repo_root: Path) -> dict:
 
 # --------------------------------------------------------------------------- specs
 @dataclass(frozen=True)
-class PromptSpec:
-    id: str                    # "p1".."p4"
-    arm: str
-    mode: str                  # grounded | wrap
-    trim: str                  # wiki | distill | wrap
+class StyleSpec:
+    """One of the four wrap styles. Only used by mode wrap_multi."""
+    style: str                 # easy | hard | wiki | qa
     path: Path
     text: str
-    input_drop: int | None     # None => derive max_model_len - max_tokens
     expected_overhead: int
 
 
 @dataclass(frozen=True)
+class PromptSpec:
+    id: str                    # "p1" | "p2"
+    arm: str
+    mode: str                  # grounded | wrap_multi
+    trim: str                  # wiki | distill | wrap
+    path: Path | None          # None for wrap_multi -- the text lives in `styles`
+    text: str | None           # None for wrap_multi
+    input_drop: int | None     # None => derive max_model_len - max_tokens
+    expected_overhead: int | None   # None for wrap_multi -- per style, see `styles`
+    # Four entries for wrap_multi, empty otherwise. ORDER IS PART OF THE SEED: the style
+    # RNG draws an index into it. See src/rewrite/wrap_styles.py.
+    styles: tuple = ()
+    # Measured output/input token ratio in llama-2 tokens, and the resulting estimate.
+    # Provenance: docs/DESIGN_DELTA.md section 5.
+    r: float = 0.0
+    est_output_tokens: int = 0
+
+    def texts(self) -> list:
+        """Every distinct prompt text this job can emit. One entry, or four for wrap_multi."""
+        return [st.text for st in self.styles] if self.styles else [self.text]
+
+    def overheads(self) -> list:
+        """(label, text, expected_overhead) for every prompt text, for the parity gate."""
+        if self.styles:
+            return [(f"{self.id}:{st.style}", st.text, st.expected_overhead)
+                    for st in self.styles]
+        return [(self.id, self.text, self.expected_overhead)]
+
+
+@dataclass(frozen=True)
 class ArmSpec:
+    """One rewritten arm. Every arm is rewritten -- there is no control arm any more.
+
+    The raw side of the corpus (the shared 20B core and the 50B quality-base control) is
+    deliberately NOT modelled here: neither consumes GPU time and neither is downloaded.
+    Both are documented in the header comment of configs/data.yaml so the token accounting
+    stays complete. See docs/DESIGN_DELTA.md section 3.
+    """
     name: str
-    repo_id: str
-    revision: str
-    rewrite: bool
+    subdir: str                # folder inside the single gated HF repo
+    docs: int                  # remainder document count, as uploaded
+    source_tokens_llama2: int  # remainder token count -- what the GPU consumes, x n_prompts
     prompts: tuple = ()
 
 
@@ -169,6 +213,35 @@ class Config:
     @property
     def text_column(self) -> str:
         return self.data["sharding"]["text_column"]
+
+    # ---- the single gated input repo ----
+    @property
+    def hf_repo_id(self) -> str:
+        return self.data["hf"]["repo_id"]
+
+    @property
+    def hf_revision(self) -> str:
+        return self.data["hf"]["revision"]
+
+    def hf_data_files(self, arm: str) -> str:
+        """The explicit glob for one arm's folder inside the single repo.
+
+        Addressed by glob and NOT by HF config name on purpose: the Hub card for this
+        dataset declares no `configs:` block, so the auto-converter exposes a single config
+        `default`/`train` globbing every folder. load_dataset(repo_id) would silently mix
+        shared-core into all five arms. See docs/DESIGN_DELTA.md section 4.
+        """
+        return self.data["hf"]["data_files_template"].format(subdir=self.arm(arm).subdir)
+
+    @property
+    def est_output_tokens_total(self) -> int:
+        """Summed per-arm estimate. Replaces the old est_output_tokens_per_arm scalar,
+        which could not express a 2.8x spread across arms."""
+        return sum(p.est_output_tokens for a in self.arms for p in a.prompts)
+
+    @property
+    def est_output_rows_total(self) -> int:
+        return sum(a.docs * len(a.prompts) for a in self.arms)
 
     @property
     def compression(self) -> str:
@@ -351,20 +424,34 @@ def load_config(config_root: Path | str | None = None) -> Config:
     if cluster["scheduler"]["kind"] not in ("bash", "slurm"):
         stop("cluster.yaml scheduler.kind must be 'bash' or 'slurm'")
 
+    # ---- the single gated input repo ----
+    hf = data.get("hf") or {}
+    for k in ("repo_id", "revision", "data_files_template"):
+        if not hf.get(k):
+            stop(f"configs/data.yaml hf.{k} is required. The input is ONE HuggingFace "
+                 "repo with one folder per arm, not six flat repos.")
+
     # ---- arms and prompts ----
     defs = data["prompt_defs"]
     arms = []
+    seen_subdirs = {}
     for a in data["arms"]:
+        for k in ("subdir", "docs", "source_tokens_llama2"):
+            if a.get(k) in (None, ""):
+                stop(f"arm {a['name']}: missing required key {k!r}. docs and "
+                     "source_tokens_llama2 make the workload auditable from data.yaml "
+                     "alone and feed the disk estimate.")
+        if a["subdir"] in seen_subdirs:
+            stop(f"arms {seen_subdirs[a['subdir']]!r} and {a['name']!r} both point at "
+                 f"subdir {a['subdir']!r}; each arm must name a distinct folder")
+        seen_subdirs[a["subdir"]] = a["name"]
+
         prompts = []
         for p in a["prompts"]:
             d = defs.get(p["def"])
             if d is None:
                 stop(f"arm {a['name']}: prompt {p['id']} references unknown "
                      f"prompt_def {p['def']!r}")
-            ppath = repo_root / p["file"]
-            if not ppath.exists():
-                stop(f"arm {a['name']}: prompt file not found: {ppath}")
-            text = ppath.read_text()
 
             mode, trim = d["mode"], d["trim"]
             if mode not in VALID_MODES:
@@ -372,42 +459,76 @@ def load_config(config_root: Path | str | None = None) -> Config:
             if trim not in VALID_TRIMS:
                 stop(f"{a['name']}/{p['id']}: trim must be one of {sorted(VALID_TRIMS)}")
 
-            # The source's own startup guards, ported.
-            # source: 07_rewrite/rewrite_worker.py:178-186
+            ppath = ptext = None
+            styles = []
+
             if mode == "grounded":
-                n = text.count(TEXT_PLACEHOLDER)
+                if not p.get("file"):
+                    stop(f"{a['name']}/{p['id']}: mode 'grounded' requires a prompt file")
+                ppath = repo_root / p["file"]
+                if not ppath.exists():
+                    stop(f"arm {a['name']}: prompt file not found: {ppath}")
+                ptext = ppath.read_text()
+                # The source's own startup guards, ported.
+                # source: 07_rewrite/rewrite_worker.py:178-186
+                n = ptext.count(TEXT_PLACEHOLDER)
                 if n != 1:
                     stop(f"{a['name']}/{p['id']} ({ppath.name}): grounded prompt must "
                          f"contain exactly one {TEXT_PLACEHOLDER} placeholder, found {n}")
                 if trim == "wrap":
                     stop(f"{a['name']}/{p['id']}: trim 'wrap' is only valid with "
-                         "mode 'wrap'")
+                         "mode 'wrap_multi'")
             else:
-                if not text.endswith(WRAP_SUFFIX):
-                    stop(f"{a['name']}/{p['id']} ({ppath.name}): wrap prompt must end "
-                         f"with {WRAP_SUFFIX!r} -- the document is concatenated directly "
-                         "after it (source: rewrite_worker.py:50-51)")
-                if TEXT_PLACEHOLDER in text:
-                    stop(f"{a['name']}/{p['id']}: wrap prompts concatenate the document; "
-                         f"they must not contain {TEXT_PLACEHOLDER}")
+                # ---- wrap_multi: ONE job, FOUR style prompts, one per document ----
+                if p.get("file"):
+                    stop(f"{a['name']}/{p['id']}: mode 'wrap_multi' takes its prompts "
+                         "from prompt_defs.<def>.styles, not from a `file:` key")
                 if trim != "wrap":
-                    stop(f"{a['name']}/{p['id']}: mode 'wrap' requires trim 'wrap'")
+                    stop(f"{a['name']}/{p['id']}: mode 'wrap_multi' requires trim 'wrap'")
+                spec_styles = d.get("styles") or []
+                names = [st["style"] for st in spec_styles]
+                if names != WRAP_STYLES:
+                    stop(f"{a['name']}/{p['id']}: prompt_def {p['def']!r} styles are "
+                         f"{names}, expected exactly {WRAP_STYLES} IN THAT ORDER. The "
+                         "order is part of the reproducible seed -- the style RNG draws "
+                         "an index into it, so reordering silently changes which document "
+                         "gets which style (source: 07_rewrite/rewrite_worker.py:39).")
+                for st in spec_styles:
+                    spath = repo_root / st["file"]
+                    if not spath.exists():
+                        stop(f"arm {a['name']}: wrap style prompt file not found: {spath}")
+                    stext = spath.read_text()
+                    if not stext.endswith(WRAP_SUFFIX):
+                        stop(f"{a['name']}/{p['id']} ({spath.name}): wrap prompt must end "
+                             f"with {WRAP_SUFFIX!r} -- the document is concatenated "
+                             "directly after it (source: rewrite_worker.py:50-51)")
+                    if TEXT_PLACEHOLDER in stext:
+                        stop(f"{a['name']}/{p['id']} ({spath.name}): wrap prompts "
+                             f"concatenate the document; they must not contain "
+                             f"{TEXT_PLACEHOLDER}")
+                    styles.append(StyleSpec(style=st["style"], path=spath, text=stext,
+                                            expected_overhead=int(st["expected_overhead"])))
+                if len({st.text for st in styles}) != len(styles):
+                    stop(f"{a['name']}/{p['id']}: two wrap styles have identical prompt "
+                         "text; the style assignment would be unrecoverable")
 
             prompts.append(PromptSpec(
-                id=p["id"], arm=a["name"], mode=mode, trim=trim, path=ppath, text=text,
+                id=p["id"], arm=a["name"], mode=mode, trim=trim, path=ppath, text=ptext,
                 input_drop=(None if d["input_drop"] is None else int(d["input_drop"])),
-                expected_overhead=int(d["expected_overhead"]),
+                expected_overhead=(None if mode == "wrap_multi"
+                                   else int(d["expected_overhead"])),
+                styles=tuple(styles),
+                r=float(p.get("r") or 0.0),
+                est_output_tokens=int(p.get("est_output_tokens") or 0),
             ))
 
-        if a["rewrite"] and not prompts:
-            stop(f"arm {a['name']} has rewrite: true but no prompts")
-        if not a["rewrite"] and prompts:
-            stop(f"arm {a['name']} is a control arm (rewrite: false) but declares "
-                 f"{len(prompts)} prompt(s); controls are never rewritten")
+        if not prompts:
+            stop(f"arm {a['name']} declares no prompts; every arm is rewritten")
 
-        arms.append(ArmSpec(name=a["name"], repo_id=a["repo_id"],
-                            revision=a.get("revision") or "main",
-                            rewrite=bool(a["rewrite"]), prompts=tuple(prompts)))
+        arms.append(ArmSpec(name=a["name"], subdir=a["subdir"],
+                            docs=int(a["docs"]),
+                            source_tokens_llama2=int(a["source_tokens_llama2"]),
+                            prompts=tuple(prompts)))
 
     cfg = Config(repo_root=repo_root, cluster=cluster, data=data, vllm=vllm, env=env,
                  paths=paths, arms=tuple(arms))
@@ -421,24 +542,28 @@ def load_config(config_root: Path | str | None = None) -> Config:
         stop("compute_constraints.allowed_gpu_arch entries must look like 'sm_100'")
 
     # ---- the job count is a hard assertion, not a comment ----
-    n_jobs = sum(len(a.prompts) for a in arms if a.rewrite)
+    n_jobs = sum(len(a.prompts) for a in arms)
     expected = int(data["expected_jobs"])
     if n_jobs != expected:
         stop(f"configs/data.yaml enumerates {n_jobs} rewrite jobs but expected_jobs is "
              f"{expected}. A typo here would silently skip a whole pass over an arm.")
-    if not data.get("semantics", {}).get("full_cross_product"):
-        stop("configs/data.yaml semantics.full_cross_product must be true: every prompt "
-             "rewrites the ENTIRE dataset for its arm.")
+    if not data.get("semantics", {}).get("full_coverage"):
+        stop("configs/data.yaml semantics.full_coverage must be true: every prompt covers "
+             "EVERY document of its arm exactly once. (This replaced full_cross_product in "
+             "round 4: wrap-inspired's styled pass covers every document once using one of "
+             "four styles per document, which is full coverage but not a cross product.)")
     return cfg
 
 
 # --------------------------------------------------------------------------- jobs
 def enumerate_jobs(cfg: Config) -> list:
-    """The 12 jobs, in a stable order (arm order in data.yaml, then prompt id)."""
+    """The 10 jobs, in a stable order (arm order in data.yaml, then prompt id).
+
+    Five arms x two prompts. wrap-inspired's p1 is ONE job that emits four different style
+    prompts, one per document -- not four jobs. See docs/DESIGN_DELTA.md section 2.
+    """
     jobs = []
     for a in cfg.arms:
-        if not a.rewrite:
-            continue
         for p in a.prompts:
             jobs.append(JobSpec(
                 job_id=f"{a.name}__{p.id}", arm=a.name, prompt=p,
@@ -458,12 +583,23 @@ def get_job(cfg: Config, arm: str, prompt_id: str) -> JobSpec:
 
 def describe_jobs(cfg: Config) -> str:
     """Human-readable enumeration, printed by preflight so it can be eyeballed."""
-    lines = [f"{'#':>3}  {'JOB':32s} {'MODE':9s} {'TRIM':8s} {'DROP':>7s}  PROMPT"]
+    lines = [f"{'#':>3}  {'JOB':28s} {'MODE':11s} {'TRIM':8s} {'DROP':>7s}  PROMPT"]
     for i, j in enumerate(enumerate_jobs(cfg), 1):
         drop, derived = resolve_drop_threshold(j.prompt, cfg.max_model_len, cfg.max_tokens)
-        lines.append(
-            f"{i:3d}  {j.job_id:32s} {j.prompt.mode:9s} {j.prompt.trim:8s} "
-            f"{drop:7d}{'*' if derived else ' '} {j.prompt.path.relative_to(cfg.repo_root)}"
-        )
+        if j.prompt.styles:
+            # One job, four prompts. Show every one -- a reader must be able to see that
+            # this single line of the table is where four style prompts live.
+            head = (f"{i:3d}  {j.job_id:28s} {j.prompt.mode:11s} {j.prompt.trim:8s} "
+                    f"{drop:7d}{'*' if derived else ' '} "
+                    f"{len(j.prompt.styles)} styles, one per document:")
+            lines.append(head)
+            for st in j.prompt.styles:
+                lines.append(f"{'':>3}  {'':28s} {'':11s} {'':8s} {'':>7s}   "
+                             f"{st.style:5s} {st.path.relative_to(cfg.repo_root)}")
+        else:
+            lines.append(
+                f"{i:3d}  {j.job_id:28s} {j.prompt.mode:11s} {j.prompt.trim:8s} "
+                f"{drop:7d}{'*' if derived else ' '} "
+                f"{j.prompt.path.relative_to(cfg.repo_root)}")
     lines.append("     (* = derived as max_model_len - max_tokens, source: 09_Distill)")
     return "\n".join(lines)

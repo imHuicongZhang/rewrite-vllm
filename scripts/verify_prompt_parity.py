@@ -97,39 +97,63 @@ def main(argv=None) -> int:
 
     tok = AutoTokenizer.from_pretrained(str(model))
 
+    def _units(arm, pr, d):
+        """(label, file, expected_overhead) for every prompt TEXT this job can emit.
+
+        One for a grounded job; four for wrap-inspired's styled pass, which carries its
+        prompts in prompt_defs[<def>].styles rather than in a `file:` key.
+        """
+        if d["mode"] == "wrap_multi":
+            return [(f"{pr['id']}:{st['style']}", st["file"], int(st["expected_overhead"]))
+                    for st in d["styles"]]
+        return [(pr["id"], pr["file"], int(d["expected_overhead"]))]
+
     rows, failures, seen_text = [], [], {}
     for arm in data["arms"]:
         for pr in arm["prompts"]:
             d = defs[pr["def"]]
-            path = root / pr["file"]
-            if not path.exists():
-                failures.append((arm["name"], pr["id"], "MISSING FILE", str(path)))
-                continue
-            text = path.read_text()
+            for label, rel, exp in _units(arm, pr, d):
+                path = root / rel
+                if not path.exists():
+                    failures.append((arm["name"], label, "MISSING FILE", str(path)))
+                    continue
+                text = path.read_text()
 
-            # Structural guards, same ones config.py applies at load time.
-            if d["mode"] == "grounded" and text.count("[TEXT]") != 1:
-                failures.append((arm["name"], pr["id"], "STRUCTURE",
-                                 f"expected exactly one [TEXT], found "
-                                 f"{text.count('[TEXT]')}"))
-                continue
-            if d["mode"] == "wrap" and not text.endswith("\n\nPassage:\n"):
-                failures.append((arm["name"], pr["id"], "STRUCTURE",
-                                 "wrap prompt must end with '\\n\\nPassage:\\n'"))
-                continue
+                # Structural guards, same ones config.py applies at load time.
+                if d["mode"] == "grounded" and text.count("[TEXT]") != 1:
+                    failures.append((arm["name"], label, "STRUCTURE",
+                                     f"expected exactly one [TEXT], found "
+                                     f"{text.count('[TEXT]')}"))
+                    continue
+                if d["mode"] == "wrap_multi" and not text.endswith("\n\nPassage:\n"):
+                    failures.append((arm["name"], label, "STRUCTURE",
+                                     "wrap prompt must end with '\\n\\nPassage:\\n'"))
+                    continue
 
-            content = text.replace("[TEXT]", "") if "[TEXT]" in text else text
-            rendered = tok.apply_chat_template(
-                [{"role": chat["role"], "content": content}],
-                tokenize=chat["tokenize"],
-                add_generation_prompt=chat["add_generation_prompt"])
-            got = len(tok(rendered, add_special_tokens=False).input_ids)
-            exp = int(d["expected_overhead"])
-            rows.append((arm["name"], pr["id"], pr["def"], got, exp, path, text))
-            seen_text.setdefault(text, []).append(f"{arm['name']}/{pr['id']}")
-            if got != exp:
-                failures.append((arm["name"], pr["id"], "OVERHEAD",
-                                 f"got {got}, expected {exp}"))
+                content = text.replace("[TEXT]", "") if "[TEXT]" in text else text
+                rendered = tok.apply_chat_template(
+                    [{"role": chat["role"], "content": content}],
+                    tokenize=chat["tokenize"],
+                    add_generation_prompt=chat["add_generation_prompt"])
+                got = len(tok(rendered, add_special_tokens=False).input_ids)
+                rows.append((arm["name"], label, pr["def"], got, exp, path, text))
+                seen_text.setdefault(text, []).append(f"{arm['name']}/{label}")
+                if got != exp:
+                    failures.append((arm["name"], label, "OVERHEAD",
+                                     f"got {got}, expected {exp}"))
+
+    # The style ORDER is part of the reproducible seed, so verify it here too -- this
+    # script is run standalone, without config.py's loader.
+    for arm in data["arms"]:
+        for pr in arm["prompts"]:
+            d = defs[pr["def"]]
+            if d["mode"] != "wrap_multi":
+                continue
+            names = [st["style"] for st in d["styles"]]
+            if names != ["easy", "hard", "wiki", "qa"]:
+                failures.append((arm["name"], pr["id"], "STYLE ORDER",
+                                 f"{names} != ['easy','hard','wiki','qa']; the order is "
+                                 f"part of the seed (rewrite_worker.py:39)"))
 
     w = max((len(f"{a}/{i}") for a, i, *_ in rows), default=20)
     print(f"{'JOB':{w}}  {'PROMPT DEF':12}  {'GOT':>5} {'EXPECTED':>9}  RESULT")
@@ -138,7 +162,7 @@ def main(argv=None) -> int:
         print(f"{arm + '/' + pid:{w}}  {dname:12}  {got:5d} {exp:9d}  {mark}")
 
     print()
-    print("distinct prompt texts across the 12 jobs:")
+    print(f"distinct prompt texts across the {len(rows)} (job, prompt-text) pairs:")
     for text, users in sorted(seen_text.items(), key=lambda kv: kv[1][0]):
         head = " ".join(text.split())[:58]
         print(f"  {len(users)} job(s): {', '.join(users)}")

@@ -1,0 +1,3 @@
+Rewrite the following passage using precise, formal, scholarly language. Preserve all information and add no new facts. Output ONLY the rewritten passage, with no preamble or commentary.
+
+Passage:

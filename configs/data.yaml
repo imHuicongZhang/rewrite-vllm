@@ -3,45 +3,70 @@
 # The blanks below are Wytro's to fill. Everything NOT marked is fixed by the workload
 # specification or copied from the source pipeline and must not be edited.
 #
-# Six arms. Five are rewritten; quality-base is the CONTROL and is never rewritten --
-# it is downloaded and verified only, so the token accounting is complete.
+# Five arms, two prompts each. Every arm is rewritten.
 #
-#   arm                  prompts   rewrite jobs
-#   quality-base            0         0   <- control
-#   quality-first           2         2
-#   diversity-oriented      2         2
-#   disagreement-aware      2         2
-#   wrap-inspired           4         4
-#   rewire-inspired         2         2
-#                                    12
+#   arm                  prompts   rewrite jobs   source tokens (llama-2)
+#   quality-first           2         2                 60.0 B
+#   diversity-oriented      2         2                 60.0 B
+#   disagreement-aware      2         2                 60.0 B
+#   wrap-inspired           2         2                 60.0 B
+#   rewire-inspired         2         2                120.0 B
+#                                    10                360.0 B
+#
+# ---------------------------------------------------------------------------------------
+# WHICH TOKENS GO THROUGH THE GPU, AND WHICH DO NOT
+#
+# The corpus is built half+half: a shared RAW CORE plus a block-specific REMAINDER.
+# Only the remainder is rewritten. This pipeline downloads and processes remainders ONLY.
+#
+#   THROUGH THE GPU        360.0 B source tokens x 2 passes = 720.0 B input tokens
+#                          -> 261.5 B output tokens (measured; see est_output_tokens below)
+#
+#   NEVER THROUGH A GPU     70.0 B tokens, NOT downloaded by this pipeline:
+#     shared-core    20,000,010,702 tok   17,909,083 docs
+#         The raw half. Carried into training by all five arms above, byte-identical in
+#         each (proven by sha256 at 02_select/select_600m.py:631-637). It lives on the Hub
+#         at Know-Your-Sources-7B/shared-core/ and is joined back on doc_id downstream.
+#         Rewriting it would be five-times-redundant work, so it is not rewritten at all.
+#     quality-base   50,000,002,028 tok   37,298,288 docs
+#         The raw-text CONTROL block. Never rewritten and NEVER UPLOADED -- it exists only
+#         at datasets/rewrite/01_before_rw/quality-base/ (02_select/upload_blocks.py:15-16:
+#         "has no place in a repo whose purpose is to feed the rewriting stage").
+#
+#   Both are recorded here as a COMMENT and not as arms, deliberately: neither consumes GPU
+#   time, and downloading 20 B raw core tokens onto the run machine would cost bandwidth and
+#   disk for nothing. preflight, the manifest and the job enumeration all ignore them.
+#   Whoever assembles the final training mixes needs both; nothing here produces or moves them.
+#
+#   Token convention throughout: tokens-llama2 + 1 (one leading BOS), per
+#   02_select/select_600m.py:136,273.
+# ---------------------------------------------------------------------------------------
 #
 # SEMANTICS -- the thing that is easiest to get wrong:
-# EACH PROMPT REWRITES THE ENTIRE DATASET FOR ITS ARM. Prompts are NOT partitioned across
-# documents, NOT sampled per document, NOT round-robined. wrap-inspired with 4 prompts
-# means 4 COMPLETE PASSES over the whole wrap-inspired corpus, producing 4 output shard
-# sets. This is asserted in code: output row count per (arm, prompt) must equal the arm's
-# input row count, or the job fails.
+# EVERY PROMPT COVERS EVERY DOCUMENT OF ITS ARM EXACTLY ONCE. Output row count per
+# (arm, prompt) must equal the arm's input row count, or the job fails. That holds for all
+# ten jobs, including wrap-inspired's styled pass, which covers every document once using
+# ONE OF FOUR styles per document rather than one fixed prompt. See `styles:` below.
 
-expected_jobs: 12          # hard-asserted against the enumeration below
+expected_jobs: 10          # hard-asserted against the enumeration below
 
 semantics:
-  # See the note above. Enforced by rewrite.data.verify_job().
-  # NOTE: this DIFFERS from the source pipeline, where the wrap arm assigned ONE of four
-  # styles per document via np.random.default_rng([42, shard_index]) -- a single pass, not
-  # four. Deliberate change; see docs/HANDOFF_REVIEW.md.
-  full_cross_product: true
+  # Enforced by rewrite.data.verify_job(): sum(n_rows_out) == manifest.total_rows, per job.
+  # Every document is rewritten exactly once per prompt. A prompt is never partitioned
+  # across documents, never sampled, never round-robined.
+  full_coverage: true
 
 # ---------------------------------------------------------------------------------------
 # GPU ARCHITECTURE CONSTRAINT -- Wytro's decision, not Tianjian's. Not a placeholder.
 #
-# All 12 jobs run on Blackwell only: B200 (sm_100) and B300 / Blackwell Ultra (sm_103).
+# All 10 jobs run on Blackwell only: B200 (sm_100) and B300 / Blackwell Ultra (sm_103).
 # H200 (Hopper, sm_90) is deliberately EXCLUDED even if present on the node.
 #
 # Why this is enforced in code rather than written in a README: the source data was
 # generated on H100 with FlashAttention v3, which is Hopper-only, and vLLM selects a
 # different attention backend on Blackwell. Greedy decoding at temperature=0 is not
 # bitwise identical across architectures -- an argmax can flip on a near-tie and the rest
-# of that generation diverges. Mixing Hopper and Blackwell across the 12 jobs would
+# of that generation diverges. Mixing Hopper and Blackwell across the 10 jobs would
 # confound "which arm" with "which GPU", which is exactly the comparison the experiment
 # exists to make. Restricting to one architecture family removes the confound entirely.
 #
@@ -59,6 +84,29 @@ compute_constraints:
   allowed_gpu_arch_major: [10]
   reason: "Blackwell only (B200/B300); H200 excluded to avoid confounding arm with GPU architecture"
 
+# ---------------------------------------------------------------------------------------
+# THE INPUT DATASET -- one gated HuggingFace repo with internal folder structure.
+#
+# NOT six flat repos. Each arm below names a `subdir`, and the loader addresses it by an
+# explicit data_files glob. It does NOT use HF config names, on purpose: the Hub card for
+# this dataset declares no `configs:` block, so the auto-converter reports a single config
+# `default`/`train` that globs EVERY folder. load_dataset(repo_id) would therefore silently
+# mix shared-core into all five arms and inflate each by 17.9M rows.
+#
+# ACCESS: this repo is gated (extra_gated_review: manual). Tianjian's HF account must be
+# granted access before step 2 will download anything. preflight check 3 verifies this and
+# fails with an actionable message rather than letting the run die partway through.
+# ---------------------------------------------------------------------------------------
+hf:
+  repo_id: wytro/Know-Your-Sources-7B      # source: 02_select/upload_blocks.py:67
+  # Pinned so a later push to the dataset cannot change what this run consumed halfway
+  # through. Verified against the Hub 2026-08-25.
+  revision: 6e18cda64fbd24fe46010b2aa578f14a4255076d
+  # Substituted with each arm's `subdir`. The uploaded parquet carries 34 columns; this
+  # pipeline reads only doc_id and text and ignores the other 32, which can be joined back
+  # later on doc_id.
+  data_files_template: "{subdir}/data/*.parquet"
+
 sharding:
   text_column: text
 
@@ -67,18 +115,28 @@ sharding:
   # renumbers doc_id and invalidates every .done marker -- i.e. throws the run away.
   #
   # A shard is the unit of work, of resume, and of the row-conservation proof, so its
-  # size trades tail-idle against per-shard overhead. Sized for ~100 GPUs:
+  # size trades tail-idle against per-shard overhead AND against filesystem metadata load.
   #
-  #   rows   shard @8k tok/s   tail idle over 12 jobs   shards for a 5.6M-doc arm
-  #   10000     11.5 min            2.3 GPU-hours          561   <- FAILS the 20:1 guard
-  #    5000      5.7 min            1.1 GPU-hours         1121   <- FAILS at 100 GPUs
-  #    2000      2.3 min            0.5 GPU-hours         2802   <- fits, 28:1
-  #    1000      1.1 min            0.2 GPU-hours         5603   more files, thinner batches
+  # Round 3 chose 2000 because the smallest arm then had 5,602,476 docs, where 10,000-row
+  # shards gave only 561 shards and FAILED the min_shards_per_gpu guard at 100 GPUs. The
+  # smallest remainder is now 33,381,230 docs -- 6x larger -- so that failure mode is gone
+  # and every candidate passes with room. Recomputed against the real counts:
   #
-  # 2000 is the choice: it satisfies 20:1 for every arm at 100 GPUs, keeps the tail under
-  # a few minutes, and still gives vLLM a batch far larger than its default max_num_seqs.
-  # At 8 GPUs anything from 2000 to 10000 works; 2000 is fine there too.
-  shard_target_rows: 2000
+  #   rows    input shards   output files   smallest arm   ratio @100 GPU   tail
+  #    2000       147,955        591,820         16,691         167:1       ~2 min
+  #    5000        59,184        236,736          6,677          67:1       ~6 min  <- chosen
+  #   10000        29,594        118,376          3,339          33:1      ~11 min
+  #   16000        18,497         73,988          2,087          21:1      ~18 min
+  #
+  # 5000 is the choice. At 2000 the run creates 147,955 input shards and ~592k output files
+  # -- 63,241 shards for rewire-inspired alone -- which is heavy metadata load on a shared
+  # filesystem to save four minutes of tail per job.
+  #
+  # It stays an explicit constant rather than being derived from num_gpus, for the round-3
+  # reason that still holds: num_gpus lives in Tianjian's cluster.yaml, while shard size
+  # feeds the fingerprint. Deriving one from the other would let a machine-local setting
+  # silently renumber doc_id.
+  shard_target_rows: 5000
 
   # Secondary cap, so one run of very long documents cannot become a multi-hour shard.
   shard_target_bytes: 268435456     # 256 MiB of raw UTF-8 text
@@ -88,29 +146,48 @@ sharding:
   # this and tells you what to set shard_target_rows to.
   min_shards_per_gpu: 20
 
-  # doc_id is the key that joins rewritten output back to the input corpus. Requiring the
-  # datasets to carry their own makes that key durable and independent of this pipeline's
-  # sharding. Set false ONLY if a dataset genuinely cannot supply one; the fallback is a
-  # synthesized row index, which is deterministic but ties the join to data_root/shards/
-  # surviving. Whichever applies is recorded per arm in the manifest as doc_id_source.
+  # doc_id is the key that joins rewritten output back to the input corpus, and the key
+  # that reassembles the rewritten remainder with the raw shared-core half. The uploaded
+  # parquet carries it (int64, globally unique across the 600M-document corpus, stable
+  # across blocks), so this will resolve to doc_id_source: dataset for all five arms.
+  #
+  # Set false ONLY if a dataset genuinely cannot supply one; the fallback is a synthesized
+  # row index, which is deterministic but ties the join to data_root/shards/ surviving.
+  # Whichever applies is recorded per arm in the manifest as doc_id_source AND folded into
+  # the fingerprint, because flipping this renumbers every row.
+  #
+  # NOTE on uniqueness: doc_id is unique WITHIN an arm's remainder (asserted upstream), but
+  # NOT across arms -- remainders are drawn from the same core-excluded pool by different
+  # criteria, so the same document can appear in several arms. That is expected and
+  # harmless: the downstream join key is (doc_id, arm, prompt_id), which the output rows
+  # carry. Do not add a cross-arm disjointness check here; it belongs upstream at
+  # 13_600M/02_select where the id arrays are local.
   require_doc_id: true
 
 output:
   format: jsonl
-  # The 10 keys written per row. status and n_output_tokens_llama2 are beyond the 8-key
+  # The 11 keys written per row. status and n_output_tokens_llama2 are beyond the 8-key
   # spec because the ported trim logic filters on status==2 and the token budget is
   # counted in Llama-2 tokens, exactly as the source did.
+  #
+  # wrap_style carries the per-document style for wrap-inspired's styled pass and is the
+  # EMPTY STRING for the other nine jobs. The source added this column only in wrap mode
+  # (07_rewrite/rewrite_worker.py:316-323); here it is present in every row of every job so
+  # the ten output sets share one schema. Without it the style assignment is unrecoverable
+  # after the fact.
   keys: [doc_id, arm, prompt_id, source_text_sha1, rewritten_text, finish_reason,
-         n_prompt_tokens, n_output_tokens, status, n_output_tokens_llama2]
+         n_prompt_tokens, n_output_tokens, status, n_output_tokens_llama2, wrap_style]
   # Sizing model used by scripts/preflight.py for its free-disk check. Stated here so the
   # estimate is auditable rather than magic:
   #   bytes ~= bytes_per_output_token * output_tokens + bytes_per_row_overhead * rows
   # 4.2 B/token = ~3.8 chars/token of UTF-8 English + ~10% JSON string escaping.
-  # 220 B/row  = the JSON envelope (keys, doc_id, 40-char sha1, counts, punctuation).
+  # 235 B/row  = the JSON envelope (keys, doc_id, 40-char sha1, counts, punctuation),
+  #              raised from 220 for the wrap_style key.
   bytes_per_output_token: 4.2
-  bytes_per_row_overhead: 220
-  # Your stated scale, used for the total estimate when row counts are not yet known.
-  est_output_tokens_per_arm: 100000000000
+  bytes_per_row_overhead: 235
+  # There is no est_output_tokens_per_arm scalar any more. The real per-arm figures span
+  # 35.9B to 99.5B -- a 2.8x spread -- so a single number cannot express them. Each arm
+  # carries its own est_output_tokens, measured; preflight sums them.
 
 shuffle:
   # All three copied from the source (pp_io.py / 03_mix_shared_top.py). Do not change:
@@ -128,108 +205,152 @@ postprocess:
   in_place: true
 
 upload:
-  # One repo per (arm, prompt). {arm} and {prompt_id} are substituted.
+  # One repo per (arm, prompt) = 10 repos. {arm} and {prompt_id} are substituted.
   repo_template: "<<<WYTRO: output HF repo id template, e.g. your-org/rewrite-{arm}-{prompt_id}>>>"
   private: true
   stage: shuffled            # raw | trimmed | shuffled
 
 # ---------------------------------------------------------------------------------------
 # Prompt definitions. The four fields carry the source's per-prompt asymmetry; the prompt
-# TEXT lives in prompts/<arm>/<id>.txt and is byte-identical to the source.
+# TEXT lives in prompts/<arm>/<file> and is byte-identical to the source.
 #
-#   mode              grounded -> prompt.replace("[TEXT]", doc)   (source: build_content)
-#                     wrap     -> prompt + doc  (prompt already ends "\n\nPassage:\n")
+#   mode              grounded   -> prompt.replace("[TEXT]", doc)   (source: build_content)
+#                     wrap_multi -> one of `styles` per document, chosen by seeded RNG;
+#                                   style prompt + doc  (style prompt ends "\n\nPassage:\n")
 #   trim              which ported trim rule applies (docs/POSTPROCESSING.md)
 #   input_drop        status=0 threshold on the TEMPLATED token count.
 #                     null => derived as max_model_len - max_tokens = 28672, so every kept
 #                     doc gets the full 4096-token output budget (source: 09_Distill).
 #   expected_overhead empty-document chat-templated token count. A PARITY GATE: preflight
 #                     asserts it, so a changed prompt/template/tokenizer is caught before
-#                     any GPU time is spent. 185 is the value the source itself logged.
+#                     any GPU time is spent. For wrap_multi it is per style, and all four
+#                     are asserted.
 # ---------------------------------------------------------------------------------------
 prompt_defs:
   p1_wiki:    {mode: grounded, trim: wiki,    input_drop: 30720, expected_overhead: 150}
   p2_distill: {mode: grounded, trim: distill, input_drop: null,  expected_overhead: 185}
-  wrap_easy:  {mode: wrap,     trim: wrap,    input_drop: 30720, expected_overhead: 72}
-  wrap_hard:  {mode: wrap,     trim: wrap,    input_drop: 30720, expected_overhead: 66}
-  wrap_wiki:  {mode: wrap,     trim: wrap,    input_drop: 30720, expected_overhead: 73}
-  wrap_qa:    {mode: wrap,     trim: wrap,    input_drop: 30720, expected_overhead: 83}
 
+  # wrap-inspired's styled pass. ONE job, FOUR prompts, one chosen per document.
+  #
+  # Style assignment is np.random.default_rng([42, shard_index]).integers(0, 4, n_rows),
+  # verbatim from 07_rewrite/rewrite_worker.py:54-62 -- see src/rewrite/wrap_styles.py.
+  # It is keyed ONLY by (42, shard_index), never by worker id or claim order, so a worker
+  # restarting shard N reproduces the identical assignment. THE ORDER OF `styles` BELOW IS
+  # PART OF THE SEED: the RNG draws an index into it. Reordering these four entries
+  # silently changes which document gets which style.
+  #
+  # trim and input_drop are uniform across the four styles; only the text and the
+  # empty-document overhead differ.
+  wrap_styled:
+    mode: wrap_multi
+    trim: wrap
+    input_drop: 30720
+    styles:
+      - {style: easy, file: prompts/wrap-inspired/style_easy.txt, expected_overhead: 72}
+      - {style: hard, file: prompts/wrap-inspired/style_hard.txt, expected_overhead: 66}
+      - {style: wiki, file: prompts/wrap-inspired/style_wiki.txt, expected_overhead: 73}
+      - {style: qa,   file: prompts/wrap-inspired/style_qa.txt,   expected_overhead: 83}
+
+# ---------------------------------------------------------------------------------------
+# The five arms.
+#
+# Each carries the measured numbers so the workload is auditable from this file alone:
+#   docs / source_tokens_llama2  the REMAINDER as uploaded -- what the GPU consumes.
+#                                Source: <subdir>/stats.json on the Hub, cross-checked
+#                                against 02_select/select_600m.py:77-83 budgets.
+#   r                            measured output/input token ratio for that prompt, in
+#                                llama-2 tokens. Census-exact, from the 1.5B run's
+#                                07_rewrite/progress/*.json and 09_Distill/progress/*.json.
+#                                Validated: r_p1 + r_p2 reproduces the yields recorded
+#                                independently at 02_select/select_600m.py:114-123
+#                                (0.598 / 0.640 / 0.666 / 0.797 / 0.829) to 3 decimals.
+#   est_output_tokens            source_tokens_llama2 * r. Feeds the preflight disk check.
+#
+# Full derivation, and what happened to the outputs these were measured from:
+# docs/DESIGN_DELTA.md section 5.
+# ---------------------------------------------------------------------------------------
 arms:
-  - name: quality-base
-    repo_id: "<<<WYTRO: HF dataset repo id for quality-base (the CONTROL arm)>>>"
-    revision: main
-    rewrite: false          # CONTROL -- downloaded and verified only, never rewritten
-    prompts: []
-
   - name: quality-first
-    repo_id: "<<<WYTRO: HF dataset repo id for quality-first>>>"
-    revision: main
-    rewrite: true
+    subdir: quality-first
+    docs: 37511431
+    source_tokens_llama2: 60000000654
     prompts:
-      - {id: p1, file: prompts/quality-first/p1.txt, def: p1_wiki}
-      - {id: p2, file: prompts/quality-first/p2.txt, def: p2_distill}
+      - {id: p1, file: prompts/quality-first/p1.txt, def: p1_wiki,
+         r: 0.3399, est_output_tokens: 20394000222}
+      - {id: p2, file: prompts/quality-first/p2.txt, def: p2_distill,
+         r: 0.2581, est_output_tokens: 15486000169}
 
   - name: diversity-oriented
-    repo_id: "<<<WYTRO: HF dataset repo id for diversity-oriented>>>"
-    revision: main
-    rewrite: true
+    subdir: diversity-oriented
+    docs: 35304301
+    source_tokens_llama2: 60000039601
     prompts:
-      - {id: p1, file: prompts/diversity-oriented/p1.txt, def: p1_wiki}
-      - {id: p2, file: prompts/diversity-oriented/p2.txt, def: p2_distill}
+      - {id: p1, file: prompts/diversity-oriented/p1.txt, def: p1_wiki,
+         r: 0.3812, est_output_tokens: 22872015096}
+      - {id: p2, file: prompts/diversity-oriented/p2.txt, def: p2_distill,
+         r: 0.2845, est_output_tokens: 17070011266}
 
   - name: disagreement-aware
-    repo_id: "<<<WYTRO: HF dataset repo id for disagreement-aware>>>"
-    revision: main
-    rewrite: true
+    subdir: disagreement-aware
+    docs: 33381230
+    source_tokens_llama2: 60000014390
     prompts:
-      - {id: p1, file: prompts/disagreement-aware/p1.txt, def: p1_wiki}
-      - {id: p2, file: prompts/disagreement-aware/p2.txt, def: p2_distill}
+      - {id: p1, file: prompts/disagreement-aware/p1.txt, def: p1_wiki,
+         r: 0.3649, est_output_tokens: 21894005250}
+      - {id: p2, file: prompts/disagreement-aware/p2.txt, def: p2_distill,
+         r: 0.2750, est_output_tokens: 16500003957}
 
   # -------------------------------------------------------------------------------------
-  # SELECTION CAVEAT FOR wrap-inspired -- read before subsampling this arm.
+  # wrap-inspired: ONE styled pass + the shared distill pass. NOT four style passes.
   #
-  # Every other arm rewrites each document TWICE (wiki + distill). wrap-inspired rewrites
-  # each document FOUR times, once per style, so its pool carries 4 copies per source
-  # document where the others carry 2.
+  # p1 assigns one of easy/hard/wiki/qa per document (see prompt_defs.wrap_styled) and
+  # records the choice in the wrap_style output column. p2 is the same distill prompt every
+  # other arm runs -- byte-identical, md5 538700534e99d5e80b268fd9b2408b48.
+  # This is what the source did: 02_select/README.md, "wrap-inspired follows the 1.5B arm
+  # exactly: pass 1 is the 4-style assignment with one style per document ... pass 2 is the
+  # shared distill prompt -- 2 rewrites per document, the same rewrite cost as every other
+  # setting."
   #
-  # At a fixed token budget this does NOT automatically mean more duplication. Under
-  # UNIFORM subsampling to a budget B, expected copies per document is
-  #     n_passes x B / pool  =  B / (tokens_per_pass_per_doc x n_docs)
-  # which is independent of the pass count -- a bigger pool is met with a smaller
-  # fraction of it. Worked at B = 5B tokens using the original run's measured figures:
-  #     quality-first       pool  5.98B   84% needed   1.67 copies/doc
-  #     wrap-inspired       pool 16.7B    30% needed   1.20 copies/doc
-  # So wrap ends up with LESS duplication than quality-first, not more.
+  # INHERITED ASYMMETRY, for whoever cuts this arm to a token budget. Uniform PER-DOCUMENT
+  # assignment balances documents but NOT tokens, because the styles expand very
+  # differently. Measured at 1.5B (10_postprocess/_step2_wrap_summary.json):
   #
-  # Under QUALITY-RANKED selection this reverses. A good document's four rewrites all
-  # score well together, so duplication concentrates on the documents that rank highest --
-  # exactly the ones the budget is spent on. The original pipeline was already alert to
-  # this: for the wrap arm specifically it supplemented with a seeded RANDOM draw rather
-  # than a quality sort, recorded in its own manifest as
-  #     "distill_selection": "seeded_random_seed42_no_quality_sort"
-  # explicitly to keep that arm comparable with the others.
+  #     style   doc share   token share   tok/doc
+  #     easy      25.05%       14.23%      223.5
+  #     hard      24.91%       33.55%      529.8
+  #     wiki      25.03%       23.16%      364.0
+  #     qa        25.02%       29.05%      456.7
   #
-  # If you are the person deciding how to cut this arm to a token budget: compute and
-  # report copies-per-document for every arm rather than assuming symmetry, and prefer a
-  # uniform or seeded-random draw over a quality sort unless you have a reason not to.
-  # Full analysis: docs/HANDOFF_REVIEW.md, C1.
+  # Documents are balanced to 25.0% +/- 0.1pp; tokens spread 2.37x. The source applied no
+  # correction and neither does this pipeline. But a uniform TOKEN draw is not a uniform
+  # STYLE draw -- if that matters, stratify on the wrap_style column.
+  #
+  # (The previous four-pass "4 copies per document" caveat is gone with the four-pass
+  # design. See docs/DESIGN_DELTA.md section 2.)
   # -------------------------------------------------------------------------------------
   - name: wrap-inspired
-    repo_id: "<<<WYTRO: HF dataset repo id for wrap-inspired>>>"
-    revision: main
-    rewrite: true
-    # FOUR COMPLETE PASSES over the whole corpus -- one per style, not one style per doc.
+    subdir: wrap-inspired
+    docs: 63226477
+    source_tokens_llama2: 60000001229
     prompts:
-      - {id: p1, file: prompts/wrap-inspired/p1.txt, def: wrap_easy}
-      - {id: p2, file: prompts/wrap-inspired/p2.txt, def: wrap_hard}
-      - {id: p3, file: prompts/wrap-inspired/p3.txt, def: wrap_wiki}
-      - {id: p4, file: prompts/wrap-inspired/p4.txt, def: wrap_qa}
+      - {id: p1, file: null, def: wrap_styled,
+         r: 0.4313, est_output_tokens: 25878000530}
+      - {id: p2, file: prompts/wrap-inspired/p2.txt, def: p2_distill,
+         r: 0.3657, est_output_tokens: 21942000449}
 
+  # rewire-inspired carries kappa = 2 on the REMAINDER (120B, not 60B) -- not 2x on the
+  # block total. Source: 02_select/select_600m.py:19-20,81.
+  #
+  # The kappa=2 headroom exists to feed a post-rewrite filter: score the REWRITTEN text
+  # with fastText and keep the top half. THAT STAGE IS NOT IMPLEMENTED IN THIS PIPELINE.
+  # This arm will ship ~99.5B output tokens UNFILTERED, and someone must filter them before
+  # they enter a training mix. See docs/DESIGN_DELTA.md section 9, open question 1.
   - name: rewire-inspired
-    repo_id: "<<<WYTRO: HF dataset repo id for rewire-inspired>>>"
-    revision: main
-    rewrite: true
+    subdir: rewire-inspired
+    docs: 126480544
+    source_tokens_llama2: 120000000593
     prompts:
-      - {id: p1, file: prompts/rewire-inspired/p1.txt, def: p1_wiki}
-      - {id: p2, file: prompts/rewire-inspired/p2.txt, def: p2_distill}
+      - {id: p1, file: prompts/rewire-inspired/p1.txt, def: p1_wiki,
+         r: 0.4628, est_output_tokens: 55536000274}
+      - {id: p2, file: prompts/rewire-inspired/p2.txt, def: p2_distill,
+         r: 0.3660, est_output_tokens: 43920000217}

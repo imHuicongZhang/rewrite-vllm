@@ -4,7 +4,7 @@
 Checks run cheapest-first so failures are fast:
 
    1  placeholders          nothing unresolved in either class
-   2  config                validates, engine args are exactly the source's, 12 jobs
+   2  config                validates, engine args are exactly the source's, 10 jobs
    3  gpus                  visible, count matches config, enough VRAM
    4  imports               vllm/torch/transformers/... import, versions match the pins
    5  model                 Qwen + Llama-2 tokenizer present and loadable
@@ -79,8 +79,12 @@ def c2_config(cfg, args) -> bool:
     n = len(jobs)
     if n != int(cfg.data["expected_jobs"]):
         return fail(f"{n} jobs enumerated, expected {cfg.data['expected_jobs']}")
-    controls = [a.name for a in cfg.arms if not a.rewrite]
-    ok(f"{n} rewrite jobs; control arm(s) never rewritten: {controls}")
+    ok(f"{n} rewrite jobs across {len(cfg.arms)} arms "
+       f"({sum(a.docs for a in cfg.arms):,} documents, "
+       f"{sum(a.source_tokens_llama2 for a in cfg.arms)/1e9:.1f}B source tokens x "
+       f"{n // max(1, len(cfg.arms))} passes)")
+    ok("raw half NOT downloaded and NOT rewritten: shared-core 20.0B/17.9M docs, "
+       "quality-base 50.0B/37.3M docs (see configs/data.yaml header)")
     print()
     print(describe_jobs(cfg))
     print()
@@ -189,7 +193,7 @@ def c3_gpus(cfg, args) -> bool:
         print("     Allowed (B200 and B300 are both Blackwell and share an attention "
               "backend), but every shard's .done sidecar records gpu_name and gpu_cc so "
               "the mixture stays auditable. Do not delete the sidecars, and do not change "
-              "compute.gpu_ids partway through the 12 jobs.")
+              "compute.gpu_ids partway through the 10 jobs.")
     else:
         ok(f"single architecture across all {n} GPU(s): {list(archs)[0]}")
 
@@ -257,17 +261,22 @@ def c6_prompts(cfg, args) -> bool:
     qtok = E.load_qwen_tokenizer(cfg)
     good = True
     seen = {}
+    n_texts = 0
     for j in enumerate_jobs(cfg):
-        got = E.empty_doc_overhead(qtok, cfg, j.prompt)
-        exp = j.prompt.expected_overhead
         drop, derived = resolve_drop_threshold(j.prompt, cfg.max_model_len, cfg.max_tokens)
-        tag = f"{j.job_id:32s} overhead={got:4d} (expected {exp:4d})  drop={drop}" \
-              f"{'*' if derived else ' '}"
-        if got != exp:
-            good = fail(tag + "  <-- prompt/template/tokenizer differs from the source")
-        else:
-            ok(tag)
-        seen[j.job_id] = got
+        # A job can carry more than one prompt text: wrap-inspired's styled pass has four,
+        # and all four are gated. Checking only the first would leave three quarters of
+        # that arm unprotected.
+        for label, got, exp in E.check_overheads(qtok, cfg, j.prompt):
+            n_texts += 1
+            tag = (f"{j.arm + '__' + label:34s} overhead={got:4d} (expected {exp:4d})  "
+                   f"drop={drop}{'*' if derived else ' '}")
+            if got != exp:
+                good = fail(tag + "  <-- prompt/template/tokenizer differs from the source")
+            else:
+                ok(tag)
+            seen[f"{j.arm}__{label}"] = got
+    ok(f"{n_texts} distinct prompt texts checked across {len(enumerate_jobs(cfg))} jobs")
     if args.emit_overheads:
         print("\n   measured overheads (for configs/data.yaml prompt_defs):")
         print("   " + json.dumps(seen, indent=2).replace("\n", "\n   "))
@@ -280,18 +289,62 @@ def c6_prompts(cfg, args) -> bool:
 
 # ------------------------------------------------------------------ 7 datasets
 def c7_datasets(cfg, args) -> bool:
+    """The input is ONE gated repo. Resolve it, prove we can actually READ it, then probe
+    each arm's folder.
+
+    The gating check is the point of this whole check. The repo is
+    `extra_gated_review: manual`, so an account that has not been granted access can list
+    the repo's files perfectly happily and only fails when it tries to fetch bytes. That
+    failure would otherwise surface partway through a multi-hour download on day one --
+    or worse, on a worker node hours after the head node succeeded from a warm cache.
+    """
     from huggingface_hub import HfApi
     api = HfApi(token=cfg.env.get("HF_TOKEN") or None)
     good = True
+
+    try:
+        info = api.dataset_info(cfg.hf_repo_id, revision=cfg.hf_revision, files_metadata=False)
+    except Exception as e:
+        return fail(f"cannot resolve {cfg.hf_repo_id}@{cfg.hf_revision[:12]}: {e}\n"
+                    f"   If this says 'gated' or '401/403', the account behind HF_TOKEN "
+                    f"has not been granted access.\n"
+                    f"   ASK WYTRO to approve it at "
+                    f"https://huggingface.co/datasets/{cfg.hf_repo_id}/settings")
+    ok(f"{cfg.hf_repo_id}  sha={str(info.sha)[:10]}  "
+       f"gated={getattr(info, 'gated', None)}  private={getattr(info, 'private', None)}")
+    if str(getattr(info, "sha", "")) != cfg.hf_revision:
+        good = fail(f"resolved sha {str(info.sha)[:12]} != pinned hf.revision "
+                    f"{cfg.hf_revision[:12]} -- the pin should name an immutable commit")
+
+    # Prove READ access, not merely metadata access. hf_hub_download of the smallest
+    # sidecar costs a few hundred KB and is the only thing that actually exercises gating.
+    from huggingface_hub import hf_hub_download
+    probe_file = f"{cfg.arms[0].subdir}/stats.json"
+    try:
+        hf_hub_download(repo_id=cfg.hf_repo_id, repo_type="dataset",
+                        revision=cfg.hf_revision, filename=probe_file,
+                        cache_dir=str(cfg.paths["hf_cache"]),
+                        token=cfg.env.get("HF_TOKEN") or None)
+        ok(f"{'':22s} read access confirmed (fetched {probe_file})")
+    except Exception as e:
+        return fail(f"metadata is readable but FILE CONTENT is not: {e}\n"
+                    f"   This is exactly the gated-access failure. Listing a gated repo "
+                    f"succeeds without access; downloading does not.\n"
+                    f"   ASK WYTRO to grant the HF_TOKEN account access to "
+                    f"{cfg.hf_repo_id} before starting the run.")
+
+    repo_files = set(api.list_repo_files(cfg.hf_repo_id, repo_type="dataset",
+                                         revision=cfg.hf_revision))
     for a in cfg.arms:
-        try:
-            info = api.dataset_info(a.repo_id, revision=a.revision)
-        except Exception as e:
-            good = fail(f"{a.name}: cannot resolve {a.repo_id}@{a.revision}: {e}")
+        n_parts = sum(1 for f in repo_files if f.startswith(f"{a.subdir}/data/")
+                      and f.endswith(".parquet"))
+        if not n_parts:
+            good = fail(f"{a.name:22s} no parquet under {a.subdir}/data/ -- is `subdir` "
+                        f"right? repo folders: "
+                        f"{sorted({f.split('/')[0] for f in repo_files if '/' in f})}")
             continue
-        role = "CONTROL (download+verify only)" if not a.rewrite else \
-               f"{len(a.prompts)} prompt(s)"
-        ok(f"{a.name:22s} {a.repo_id}  sha={str(info.sha)[:10]}  {role}")
+        ok(f"{a.name:22s} {a.subdir}/data/  {n_parts} parquet files  "
+           f"{a.docs:,} docs declared  {len(a.prompts)} prompt(s)")
         try:
             from rewrite import data as D
             D.probe_arm(cfg, a.name, log=lambda m: None)
@@ -359,13 +412,17 @@ def c9_disk(cfg, args) -> bool:
         except SystemExit:
             known = False
 
-    n_rewrite_arms = sum(1 for a in cfg.arms if a.rewrite)
-    est_tokens = float(o["est_output_tokens_per_arm"]) * n_rewrite_arms
+    n_arms = len(cfg.arms)
+    # Per-arm, measured. There is no est_output_tokens_per_arm scalar any more: the real
+    # per-arm figures span 35.9B to 99.5B, so one number could not express them and the
+    # old 100B x 5 = 500B overstated the total by 1.91x. Provenance for the ratios these
+    # come from: docs/DESIGN_DELTA.md section 5.
+    est_tokens = float(cfg.est_output_tokens_total)
     if known:
-        est_rows = sum(rows_by_arm[a.name] * len(a.prompts)
-                       for a in cfg.arms if a.rewrite)
+        est_rows = sum(rows_by_arm[a.name] * len(a.prompts) for a in cfg.arms)
     else:
-        est_rows = est_tokens / 2000.0     # ~2k output tokens/doc, source ratio
+        # Declared doc counts, which are the same numbers the estimates were built from.
+        est_rows = float(cfg.est_output_rows_total)
 
     raw = est_tokens * bpt + est_rows * bpr
     comp = raw * 0.30 if cfg.compression == "zstd" else raw
@@ -373,8 +430,14 @@ def c9_disk(cfg, args) -> bool:
     print(f"   sizing assumption: {bpt} bytes/output token "
           f"(~3.8 chars/token UTF-8 + ~10% JSON escaping) + {bpr:.0f} bytes/row of JSON "
           f"envelope")
-    print(f"   estimate: {est_tokens/1e9:.0f}B output tokens over "
-          f"{est_rows/1e6:.0f}M rows across {n_rewrite_arms} rewritten arms")
+    print(f"   estimate: {est_tokens/1e9:.1f}B output tokens over "
+          f"{est_rows/1e6:.0f}M rows across {n_arms} arms"
+          + ("" if known else "   [from data.yaml declared docs; no manifests yet]"))
+    for a in cfg.arms:
+        t = sum(pr.est_output_tokens for pr in a.prompts)
+        print(f"     {a.name:22s} {a.source_tokens_llama2/1e9:6.1f}B src x "
+              f"{len(a.prompts)} -> {t/1e9:6.2f}B out   "
+              f"(r={', '.join(f'{pr.r:.4f}' for pr in a.prompts)})")
     print(f"   -> raw {raw/2**40:.2f} TiB; on disk with compression="
           f"{cfg.compression}: {comp/2**40:.2f} TiB"
           + ("" if known else "   [row counts not known yet -- estimated]"))
@@ -384,8 +447,11 @@ def c9_disk(cfg, args) -> bool:
         p = cfg.paths[key]
         p.mkdir(parents=True, exist_ok=True)
         free = shutil.disk_usage(p).free
-        need = {"out_root": comp, "data_root": comp * 0.9,
-                "tmp_root": comp / max(1, n_rewrite_arms) * 1.2,
+        # data_root holds the downloaded remainders (662 GB of parquet across the five
+        # arms, per the Hub) plus the re-sharded copy, not a fraction of the output.
+        need = {"out_root": comp,
+                "data_root": 1.5 * 10**12,
+                "tmp_root": comp / max(1, n_arms) * 1.2,
                 "model_dir": 20 * 2**30}[key]
         line = f"{key:10s} {str(p):50s} free {free/2**40:.2f} TiB (needs ~{need/2**40:.2f} TiB)"
         if free < need:
@@ -405,6 +471,7 @@ def c10_smoke(cfg, args) -> bool:
     from rewrite import data as D
     from rewrite import engine as E
     from rewrite import postprocess as PP
+    from rewrite.wrap_styles import assign_wrap_styles
     from rewrite.config import enumerate_jobs, resolve_drop_threshold
 
     jobs = enumerate_jobs(cfg)
@@ -435,7 +502,13 @@ def c10_smoke(cfg, args) -> bool:
         shas = tbl.column("source_text_sha1").to_pylist()
 
         drop, _ = resolve_drop_threshold(job.prompt, cfg.max_model_len, cfg.max_tokens)
-        prep = E.prepare_batch(qtok, cfg, texts, job.prompt, drop)
+        # Shard 0, so the smoke test exercises the same style draw the real run will make
+        # for that shard -- not a fresh one.
+        smoke_styles = (assign_wrap_styles(shards[0][0], len(texts))
+                        if job.prompt.mode == "wrap_multi" else None)
+        if smoke_styles:
+            print(f"     styles for shard {shards[0][0]}: {smoke_styles}")
+        prep = E.prepare_batch(qtok, cfg, texts, job.prompt, drop, styles=smoke_styles)
         res = E.run_batch(llm, prep)
         n_l2 = [0] * len(texts)
         if prep.keep_idx:
@@ -449,6 +522,7 @@ def c10_smoke(cfg, args) -> bool:
             "finish_reason": res.finish_reason[i], "n_prompt_tokens": prep.n_in_list[i],
             "n_output_tokens": res.n_output_tokens[i], "status": res.status[i],
             "n_output_tokens_llama2": n_l2[i],
+            "wrap_style": smoke_styles[i] if smoke_styles else "",
         } for i in range(len(texts))]
 
         if len(rows) != len(texts):

@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Download all six arms, verify the `text` column, re-shard, and write the manifest.
+"""Download all five arms, verify the `text` column, re-shard, and write the manifest.
 
-quality-base is the CONTROL: it is downloaded and verified, its rows and content hash are
-recorded so the token accounting is complete, and it is flagged rewrite: false. It is
-never rewritten and produces no shards to generate from.
+The input is ONE gated HuggingFace repo with one folder per arm; each arm pulls only its
+own subdirectory. The raw half of the corpus -- the shared 20B core and the 50B
+quality-base control -- is deliberately NOT downloaded: neither is rewritten, so pulling
+20B raw tokens onto this machine would cost bandwidth and disk for nothing. Both are
+recorded in the header comment of configs/data.yaml and in manifests/data_manifest.json
+under "raw_not_rewritten" so the token accounting stays complete.
+See docs/DESIGN_DELTA.md section 3.
 
     python scripts/02_download_data.py [--arm NAME] [--count-tokens]
 
 --count-tokens runs the Llama-2 tokenizer over every arm to record exact token totals.
-That is a full extra pass over the corpus; it is off by default and is mainly useful for
-the control arm, whose tokens are never counted anywhere else.
+That is a full extra pass over the corpus and is off by default: configs/data.yaml already
+declares each arm's source_tokens_llama2 from the upstream selection stage, and the row
+count is cross-checked against `docs` on every download regardless.
 """
 from __future__ import annotations
 
@@ -25,7 +30,7 @@ from rewrite.config import load_config                   # noqa: E402
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--config-root", default=None)
-    ap.add_argument("--arm", default=None, help="only this arm (default: all six)")
+    ap.add_argument("--arm", default=None, help="only this arm (default: all five)")
     ap.add_argument("--count-tokens", action="store_true",
                     help="also count Llama-2 tokens (an extra full pass)")
     ap.add_argument("--wait-only", action="store_true",
@@ -39,7 +44,7 @@ def main(argv=None) -> int:
 
     if args.wait_only:
         import time as _t
-        pending = [a for a in arms if a.rewrite]
+        pending = list(arms)
         waited = 0
         while True:
             missing = [a.name for a in pending if not D.manifest_path(cfg, a.name).exists()]
@@ -51,15 +56,14 @@ def main(argv=None) -> int:
             _t.sleep(15)
             waited += 15
         for a in arms:
-            if a.rewrite:
-                m = D.load_manifest(cfg, a.name)
-                print(f"[data] {a.name}: ready ({m.total_rows:,} rows, {m.n_shards} shards, "
-                      f"doc_id={m.doc_id_source})")
+            m = D.load_manifest(cfg, a.name)
+            print(f"[data] {a.name}: ready ({m.total_rows:,} rows, {m.n_shards} shards, "
+                  f"doc_id={m.doc_id_source})")
         return 0
 
     for a in arms:
-        tag = "CONTROL, never rewritten" if not a.rewrite else f"{len(a.prompts)} prompts"
-        print(f"\n=== {a.name}  ({tag}) ===")
+        print(f"\n=== {a.name}  ({len(a.prompts)} prompts, "
+              f"{a.source_tokens_llama2/1e9:.1f}B source tokens) ===")
         D.download_arm(cfg, a.name)
         D.probe_arm(cfg, a.name)
         D.shard_arm(cfg, a.name, count_tokens=args.count_tokens)
@@ -70,12 +74,17 @@ def main(argv=None) -> int:
         total_jobs = 0
         for a in cfg.arms:
             m = D.load_manifest(cfg, a.name)
-            n = len(a.prompts) if a.rewrite else 0
+            n = len(a.prompts)
             total_jobs += n
             print(f"  {a.name:22s} rows={m.total_rows:>14,}  shards={m.n_shards:>7,}  "
-                  f"text={m.total_text_bytes/2**30:>8.1f} GiB  jobs={n}"
-                  + ("   <- control, rewrite: false" if not a.rewrite else ""))
+                  f"text={m.total_text_bytes/2**30:>8.1f} GiB  jobs={n}")
         print(f"  {'TOTAL REWRITE JOBS':22s} {total_jobs}")
+        print()
+        print("  NOT downloaded and NOT rewritten (the raw half of the corpus):")
+        print(f"  {'shared-core':22s} 17,909,083 docs   20.0B tokens   "
+              f"raw, carried into training by all five arms")
+        print(f"  {'quality-base':22s} 37,298,288 docs   50.0B tokens   "
+              f"raw control, never uploaded")
     return 0
 
 

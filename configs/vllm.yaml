@@ -3,7 +3,7 @@
 # There are NO <<<TIANJIAN>>> placeholders in this file, and there is nothing here for
 # either of you to tune. Every value was read out of the source pipeline or out of its
 # runtime logs; changing any of them changes generation behaviour and destroys
-# comparability between the 12 jobs and the original JHU run.
+# comparability between the 10 jobs and the original JHU run.
 #
 # The ONLY value resolved at runtime is the number of data-parallel worker processes,
 # which comes from cluster.yaml -> compute.num_gpus.

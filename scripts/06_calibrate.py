@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure real generation throughput and project wall clock for all 12 jobs.
+"""Measure real generation throughput and project wall clock for all 10 jobs.
 
 WHY, BEFORE JOB 1
 -----------------
@@ -35,6 +35,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from rewrite import data as D                                    # noqa: E402
 from rewrite.config import enumerate_jobs, load_config, resolve_drop_threshold  # noqa: E402
+from rewrite.wrap_styles import assign_wrap_styles                # noqa: E402
 
 
 def human_time(hours: float) -> str:
@@ -90,7 +91,9 @@ def rate_by_measuring(cfg, jobs, n_docs: int):
     print(f"  model loaded in {time.perf_counter() - t_load:.0f}s; "
           f"generating {len(texts)} real documents with {job.job_id}'s prompt ...")
 
-    prep = E.prepare_batch(qtok, cfg, texts, job.prompt, drop)
+    styles = (assign_wrap_styles(0, len(texts))
+              if job.prompt.mode == "wrap_multi" else None)
+    prep = E.prepare_batch(qtok, cfg, texts, job.prompt, drop, styles=styles)
     t0 = time.perf_counter()
     res = E.run_batch(llm, prep)
     dt = time.perf_counter() - t0
@@ -153,6 +156,12 @@ def main(argv=None) -> int:
         print(f"  on       : {', '.join(r['cards'])}")
     print(f"  fleet    : {ngpu} GPU(s) -> {tps * ngpu / 1e6:,.1f} M tok/s aggregate")
 
+    # Token VOLUME comes from configs/data.yaml's per-(arm, prompt) est_output_tokens,
+    # which is source_tokens_llama2 x a MEASURED ratio -- not from the measured tok/doc of
+    # a single sampled batch. The arms differ far too much for one tok/doc to stand in for
+    # all of them: source documents run 949 tok/doc in rewire-inspired and 1,600 in
+    # quality-first, and the distill prompt condenses harder than the wiki prompt. The
+    # measured rate is used for SPEED only, which is what it actually measures.
     missing = []
     total_rows = total_tok = 0
     per_job = []
@@ -162,10 +171,23 @@ def main(argv=None) -> int:
         except SystemExit:
             missing.append(job.arm)
             continue
-        tok = rows * tpd
+        est = job.prompt.est_output_tokens
+        tok = float(est) if est else rows * tpd
         total_rows += rows
         total_tok += tok
-        per_job.append((job.job_id, rows, tok, tok / (tps * ngpu) / 3600))
+        per_job.append((job.job_id, rows, tok, tok / (tps * ngpu) / 3600,
+                        (tok / rows if rows else 0.0), bool(est)))
+
+    # Sanity: does the batch we just measured agree with the config's predicted tok/doc for
+    # that same job? A large gap means either the measurement was unrepresentative or the
+    # ratios in data.yaml no longer describe this model/prompt.
+    ref = next((x for x in per_job if x[0] == jobs[0].job_id), None)
+    if ref and ref[5] and tpd:
+        pred = ref[4]
+        ratio = tpd / pred if pred else 0.0
+        note = "OK" if 0.5 <= ratio <= 2.0 else "<-- CHECK: measurement and config disagree"
+        print(f"  cross-check: {jobs[0].job_id} predicted {pred:,.0f} tok/doc from "
+              f"data.yaml, measured {tpd:,.0f} ({ratio:.2f}x)  {note}")
 
     if missing:
         print(f"\n  NOTE: no manifest yet for {sorted(set(missing))}; those jobs are not "
@@ -175,9 +197,10 @@ def main(argv=None) -> int:
         return 0
 
     print()
-    print(f"  {'JOB':32s} {'ROWS':>14s} {'OUT TOKENS':>14s} {'WALL':>10s}")
-    for jid, rows, tok, hrs in per_job:
-        print(f"  {jid:32s} {rows:14,d} {tok / 1e9:13.1f}B {human_time(hrs):>10s}")
+    print(f"  {'JOB':30s} {'ROWS':>14s} {'OUT TOKENS':>13s} {'TOK/DOC':>9s} {'WALL':>10s}")
+    for jid, rows, tok, hrs, tpd_job, measured in per_job:
+        print(f"  {jid:30s} {rows:14,d} {tok / 1e9:12.2f}B {tpd_job:9,.0f} "
+              f"{human_time(hrs):>10s}" + ("" if measured else "   [rate-derived]"))
     total_h = total_tok / (tps * ngpu) / 3600
 
     print()

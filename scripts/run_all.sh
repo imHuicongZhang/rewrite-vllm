@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The whole run, end to end, resumable:
 #
-#   preflight -> model -> data -> 12 jobs SEQUENTIALLY -> postprocess -> upload
+#   preflight -> model -> data -> 10 jobs SEQUENTIALLY -> postprocess -> upload
 #
 # Safe to re-run after ANY interruption. Finished shards are skipped via their .done
 # sidecars; finished jobs are skipped without even loading a model.
@@ -33,7 +33,7 @@ usage() {
 # `--from-job N` correct only when --from-job happened to be the first argument, and
 # `run_all.sh --status --from-job 5` set FROM_JOB to the literal string "--from-job".
 # Bash arithmetic then evaluated that bare word as 0 in `(( idx < FROM_JOB ))`, so instead
-# of erroring it silently ran all 12 jobs from job 1.
+# of erroring it silently ran all 10 jobs from job 1.
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --status)         STATUS_ONLY=1 ;;
@@ -148,7 +148,7 @@ python -u scripts/01_download_model.py --config-root "$REPO_ROOT"
 # the losers wait for the manifest rather than duplicating the work. On a multi-node run
 # it is still cleaner to do it once with --prepare-only before fanning out.
 if [[ "$DO_PREPARE" == "1" ]]; then
-  echo; echo "### data (all six arms; quality-base is verified but never rewritten)"
+  echo; echo "### data (all five arms; the raw shared-core + quality-base halves are NOT downloaded)"
   python -u scripts/02_download_data.py --config-root "$REPO_ROOT"
 else
   echo; echo "### data: skipped (not this node's role); waiting for manifests"
@@ -166,7 +166,7 @@ if [[ "$DO_GENERATE" != "1" ]]; then
   echo; echo "### generation: skipped (not this node's role)"
 fi
 
-# ---- 3. the 12 jobs, strictly sequentially -----------------------------------------
+# ---- 3. the 10 jobs, strictly sequentially -----------------------------------------
 if [[ "$DO_GENERATE" == "1" ]]; then
 echo; echo "### job table BEFORE"
 table

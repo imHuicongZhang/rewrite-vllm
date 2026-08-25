@@ -1,10 +1,18 @@
 # rewrite-vllm
 
 Rewrites five web-text corpora with Qwen2.5-7B-Instruct under vLLM, then trims and
-shuffles the output. A sixth, `quality-base`, is the control: verified, never rewritten.
-**12 jobs**, one per (arm, prompt) — each prompt rewrites its arm's corpus in full, so
-`wrap-inspired`'s 4 prompts mean 4 complete passes, not 4 slices. Plain bash, one node,
-N GPUs, no scheduler. Resumable at shard level throughout.
+shuffles the output. **10 jobs**, one per (arm, prompt): every arm gets a wiki-style or
+styled pass plus the shared distill pass, and each prompt covers its arm's corpus in full.
+Plain bash, one node, N GPUs, no scheduler. Resumable at shard level throughout.
+
+Input is **one gated HuggingFace repo**, `wytro/Know-Your-Sources-7B`, with one folder per
+arm. Only the *remainder* half of each block is rewritten: the shared 20B raw core and the
+50B `quality-base` control never touch a GPU and are not downloaded here — see
+[docs/DESIGN_DELTA.md](docs/DESIGN_DELTA.md).
+
+`wrap-inspired` is the one arm whose first pass is not a single prompt: it assigns one of
+four styles (`easy`/`hard`/`wiki`/`qa`) **per document**, seeded on `(42, shard_index)`,
+and records the choice in the `wrap_style` column.
 
 **Start here → [docs/GUIDE_FOR_TIANJIAN.md](docs/GUIDE_FOR_TIANJIAN.md)**
 
