@@ -8,8 +8,11 @@ Checks run cheapest-first so failures are fast:
    3  gpus                  visible, count matches config, enough VRAM
    4  imports               vllm/torch/transformers/... import, versions match the pins
    5  model                 Qwen + Llama-2 tokenizer present and loadable
-   6  prompt parity         empty-doc templated overhead == expected, for all 12 prompts
-   7  datasets              all six repos resolvable, each has a non-empty `text` column
+   6  prompt parity         empty-doc templated overhead == expected, for all 13
+                            (job, template) pairs -- 6 distinct texts, and wrap-inspired's
+                            styled pass carries four of them in one job
+   7  datasets              the one gated repo resolves AND is readable; each of the five
+                            arm folders exists and has a non-empty `text` column
    8  hf token              valid, and the write token really has write scope
    9  disk                  free space vs estimated output bytes (assumption printed)
   10  smoke                 8 documents end-to-end: generate -> trim -> write -> verify,
@@ -276,7 +279,14 @@ def c6_prompts(cfg, args) -> bool:
             else:
                 ok(tag)
             seen[f"{j.arm}__{label}"] = got
-    ok(f"{n_texts} distinct prompt texts checked across {len(enumerate_jobs(cfg))} jobs")
+    # Two different counts, and conflating them is how the header comment drifted:
+    #   n_texts  = (job, template) pairs asserted -- 13, because wrap-inspired's styled
+    #              pass carries four templates in one job
+    #   distinct = distinct prompt TEXTS -- 6, since the four grounded arms share p1 and
+    #              all five share the distill p2
+    n_distinct = len({t for j in enumerate_jobs(cfg) for _, t, _ in j.prompt.overheads()})
+    ok(f"{n_texts} (job, template) pair(s) asserted across "
+       f"{len(enumerate_jobs(cfg))} jobs; {n_distinct} distinct prompt texts")
     if args.emit_overheads:
         print("\n   measured overheads (for configs/data.yaml prompt_defs):")
         print("   " + json.dumps(seen, indent=2).replace("\n", "\n   "))

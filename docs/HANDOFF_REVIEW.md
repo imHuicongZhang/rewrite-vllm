@@ -1561,3 +1561,200 @@ shuffle, claiming, reaping, the Blackwell-only constraint, `min_shards_per_gpu`.
    `07_rewrite/README.md:21` and the argparse default, `0.85` in the sbatch that actually
    ran. Unchanged here; flagged only so nobody later "fixes" it by citing the README.
 
+
+---
+
+# Addendum — 2026-08-25 (final): round 6, defects and handoff
+
+Last round before handoff. Two defects, one documentation error, one ceiling to state, and a
+short check that came back negative. **Nothing on the generation path was touched** —
+`prompts/`, `engine.py`, `run_rewrite.py`, `postprocess.py`, `shuffle.py` and `vllm.yaml` are
+byte-identical to round 5.
+
+## §1 The sharding lock had no stale-lock recovery — FIXED
+
+**Disposition: fixed to the round-4 claim standard, and the failure is now covered by tests.**
+
+The report is exactly right, including the asymmetry argument. `data.py` claimed an arm with
+`lock.mkdir()` and then waited `while not existing.exists(): time.sleep(10)` — no liveness
+check, no bound. A process killed while holding it wedged every later run of the entire fleet,
+and the only signal was the same "still waiting" line every ten minutes forever. Round 4 had
+already established the correct treatment for precisely this failure mode on shard claims and
+this path never received it.
+
+**What was built**, reusing the claim discipline rather than inventing a second one:
+
+- `lock_age_s` / `heartbeat_lock` / `LockHeartbeat` / `break_lock` / `read_lock_owner` —
+  path-keyed analogues of the shard-claim helpers, sharing `fs_now()` so ages are read from
+  the shared filesystem's clock rather than a local one. The claim functions are untouched.
+- `acquire_dir_lock(lock, done_when, owner, stale_after_s, max_wait_s, label)` — returns
+  True (we hold it, do the work), returns False (`done_when()` came true while waiting), or
+  `stop()`s with the manual fix if the wait exceeds the bound.
+- The holder heartbeats for the whole held region — the dataset open *and* the batch loop.
+  Without that, sharding a 126M-document arm would go quiet past the threshold and another
+  node would take the lock over while the first was still writing into the same directory.
+- `stale_after_s` reuses `cluster.compute.claim_stale_after_s` (1800s), so the two lock
+  mechanisms share one tunable. Heartbeat interval is `min(60, stale/5)` — the same 30×
+  margin the claim path uses.
+- On takeover the new holder clears orphaned `part_*.parquet`. Reaching that code means there
+  is no manifest, so any shard files present are debris from a dead run: they cannot be
+  reused (nothing records how many there should be or what fingerprint they carry) and
+  leaving them risks mixing two runs' output.
+
+**On the design question raised:** takeover *and* a bound, not one or the other. Staleness
+handles the common case (holder died) by taking over, which is what the claim path does and
+what keeps a fleet moving. The bound only fires when a holder is alive and heartbeating but
+producing nothing — a case takeover cannot resolve — and it fails with instructions rather
+than sleeping. `SHARD_LOCK_MAX_WAIT_S` is 24h, generous because a live holder refreshes the
+lock and so never trips it.
+
+**Also found, same shape:** `scripts/02_download_data.py --wait-only`, which worker nodes run
+while one node prepares data, had its own `while True: sleep(15)` with no bound. A preparing
+node that dies leaves every worker waiting forever. Now bounded by `--wait-timeout-s`
+(default 24h), and on timeout it distinguishes the two cases — it reports which arms have no
+`.sharding.lock` at all, i.e. which have nobody preparing them.
+
+**Checked and sound:** `03_run_job.sh` uses `flock -n`, which is non-blocking and released by
+the kernel when the process dies. No stale-lock deadlock is possible there. No other
+blocking lock exists in the download or postprocess paths.
+
+**Tests (`test_integration.py` §1.5, 11 checks):** a live lock is not stolen and the wait is
+bounded; a stale lock is taken over and the new owner recorded; the waiter returns False when
+the manifest appears; **`shard_arm` with a stale lock and no manifest completes instead of
+hanging**; the lock is released on success; orphaned shard files are cleared.
+
+## §2 `preflight.py` said 12 prompts — FIXED, and it exposed an error of mine
+
+**Disposition: fixed, and a round-5 statement corrected.**
+
+It is **13**: nine grounded jobs with one template each, plus the styled pass with four. The
+check itself always iterated correctly.
+
+Grepping for siblings turned up two more, one of them mine:
+
+- `preflight.py:12` still said "all six repos resolvable" — stale since round 4, when six flat
+  repos became one gated repo with five arm folders.
+- `preflight.py:279` printed `"{n_texts} distinct prompt texts checked"`, and
+  `DESIGN_DELTA` §2 repeated it as "6 distinct texts across 10 jobs". Both wrong: `n_texts`
+  counts `(job, template)` **pairs**, which is 13. There are only **6 distinct texts** — the
+  four grounded arms share `p1`, all five share `p2`, plus four wrap styles. I conflated the
+  two counts in round 5, which is exactly how the header comment drifted in the first place.
+
+Preflight now prints both numbers with their meanings, and `DESIGN_DELTA` states the
+distinction.
+
+## §3 The Blackwell rationale argued the wrong way round — REWRITTEN
+
+**Disposition: rewritten in `configs/data.yaml` and `GUIDE_FOR_TIANJIAN.md` §2.3. Enforcement
+unchanged.**
+
+The report is correct and the error was mine. The old comment cited FlashAttention v3 and the
+H100 origin of the source data, then concluded "therefore Blackwell" — which reads as though
+Blackwell keeps this run close to the source. **H100 and H200 are both `sm_90` and share that
+path, so H200 is the architecture closest to how the source data was produced.** Excluding it
+moves this run further from the source's numerics, not nearer.
+
+Both places now say what is true:
+
+1. **One architecture family across all ten jobs** — non-negotiable, and sufficient on its
+   own, because mixing confounds "which arm" with "which GPU".
+2. **Blackwell chosen for throughput** — ~2–3× Hopper on this workload. A cost decision, not
+   a fidelity one.
+3. **The accepted cost** — a different attention backend from the H100 run, so this run is
+   **not** numerically continuous with the 1.5B corpora, and never could have been across a
+   GPU generation change (the vLLM version differs too). Cross-scale comparability rests on
+   matching prompts, budgets and selection procedure, all of which are verified.
+4. `gpu_cc` is recorded per shard either way.
+
+The constraint, the code enforcement and the "do not widen this" warnings are unchanged.
+
+## §4 The GPU ceiling — STATED, with the arithmetic
+
+**Disposition: added to `GUIDE_FOR_TIANJIAN.md` §2.2 next to `num_gpus`, and to the
+`shard_target_rows` comment in `data.yaml`. Pinned by a test.**
+
+```
+max_gpus = ceil(docs / shard_target_rows) / min_shards_per_gpu,  over the SMALLEST arm
+
+  disagreement-aware   33,381,230 / 5,000 =  6,677 shards / 20 =   333   <- binding
+  diversity-oriented   35,304,301 / 5,000 =  7,061 shards / 20 =   353
+  quality-first        37,511,431 / 5,000 =  7,503 shards / 20 =   375
+  wrap-inspired        63,226,477 / 5,000 = 12,646 shards / 20 =   632
+  rewire-inspired     126,480,544 / 5,000 = 25,297 shards / 20 = 1,264
+```
+
+**~333 GPUs.** The guide's box says what to do in both cases: at or under, nothing; above,
+stop and tell Wytro *before* running anything, because the only remedy is a smaller
+`shard_target_rows`, which changes the fingerprint and means re-preparing all the data —
+cheap before job 1, expensive after. The full per-arm table is shown in both places so a
+different arm or a different `min_shards_per_gpu` can be re-derived rather than re-guessed.
+`test_integration.py` §2.1 asserts the binding arm, the 333, and that both documents quote it.
+
+## §5 Narrowing the distill limit — NOT POSSIBLE. The premise does not hold.
+
+**Disposition: checked, short, negative. Reported rather than pursued.**
+
+The condition in the brief is satisfied — round 3 *did* verify against production logs, not
+the bake-off's: `test_trim_parity.py:145-146` reads `00_TMP/rewriting_monitor.md` and
+`rewriting_monitor_distill.md`, which are the production monitor samples from `07_rewrite`
+and `09_Distill` (18,190 + 18,000 rows).
+
+**But the recovery method cannot be applied to them.** Those files contain only model
+*outputs* — `harvest()` reads lines beginning `  - output: ` and nothing else — and they
+contain **zero** occurrences of `im_start` or `im_end`. There is no templated input in them.
+Round 3 verified the *trim rules* against production outputs; it never touched the prompt.
+
+A search for the distill prompt text across the whole source tree returns three files: the
+source's own local prompt file, and `00_Prompts/samples/nemotron_distill_{1.5B,7B}.md` —
+which are bake-off samples. **No surviving production artifact carries a templated distill
+input.** The round-5 limit stands as written and cannot be narrowed from what exists.
+
+The balance of evidence is unchanged: three artifacts carry the 842-byte form against one
+published file carrying 841, the difference is one token at the very end, and this run already
+diverges from the 1.5B numerics through the architecture and vLLM changes recorded in §3.
+Nothing changed.
+
+## §6 What was and was not executed
+
+**Ran, green:** `test_wrap_styles` 33/33; `test_integration` all checks including the 11 new
+§1.5 lock checks and 4 new §2.1 ceiling checks; `test_trim_parity` 72,443 comparisons,
+0 mismatches; `test_shuffle_parity` byte-identical; `compileall` over `src scripts tests`;
+all three YAML configs parse; `bash -n` on every shell script; `02_download_data.py --help`.
+
+**Not run:** `preflight.py` end to end and `verify_prompt_parity.py` — both need filled
+cluster paths. No GPU work.
+
+**Untouched, and verified untouched by diff:** `prompts/`, `engine.py`, `run_rewrite.py`,
+`postprocess.py`, `shuffle.py`, `configs/vllm.yaml`. Engine args, sampling params, trim rules,
+shuffle, claiming and reaping are all as round 5 left them. The ReWire budget fill and the
+doc_id disjointness check remain unimplemented by decision.
+
+## §7 Readiness list — final
+
+**Wytro, in order:**
+
+| # | item | blocks |
+|---|---|---|
+| 1 | **Grant Tianjian's HF account access to `wytro/Know-Your-Sources-7B`** (it is `gated: manual`) | everything — download is step 2 |
+| 2 | Confirm Tianjian's GPU count is ≤ ~330, or decide a new `shard_target_rows` **before job 1** | everything, if exceeded |
+| 3 | Fill `upload.repo_template` in `configs/data.yaml` and `HF_TOKEN_WRITE` in `.env` | upload only (step 6) |
+| 4 | Optional: push the `configs:` block from `data_reports/DATASET_CARD_DRAFT.md` to the Hub card | nothing |
+| 5 | Optional: fix `blab-jhu/KYS-Configs` shipping two different distill files | nothing here |
+
+**Tianjian, in order, after Wytro's 1:**
+
+| # | item | blocks |
+|---|---|---|
+| 1 | `bash scripts/00_setup_env.sh`, then paste the printed line into `env.activate_cmd` | everything |
+| 2 | Fill the 11 blanks in `configs/cluster.yaml`; `cp .env.example .env` and fill `HF_TOKEN` | everything |
+| 3 | `python scripts/check_placeholders.py` — must report zero unresolved | everything |
+| 4 | `python scripts/preflight.py` — must pass; check 7 proves gated read access, check 9 prints the disk estimate (~0.34 TiB zstd) | everything |
+| 5 | `bash scripts/run_all.sh` — model → data → calibrate → 10 jobs → postprocess → upload | — |
+
+**After generation, before the corpus is trained on:**
+
+| # | item | owner |
+|---|---|---|
+| 1 | Cut `rewire-inspired` to its 30B budget with the fastText fill — it ships ~99.5B **unfiltered** | Wytro |
+| 2 | Trim every arm's output to 30B and assemble `20B core + 30B rewritten = 50B` per arm | Wytro |
+| 3 | Read `06_calibrate.py`'s tok/doc cross-check on job 1: it settles the `r` transfer, and `quality-first`'s +19.6% headroom is the number at risk | Wytro |

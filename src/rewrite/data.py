@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .config import Config, JobSpec, stop
+
+HOSTNAME = socket.gethostname().split(".")[0]
 
 SHARD_RE = re.compile(r"part_(\d+)\.parquet$")
 MANIFEST_NAME = "manifest.json"
@@ -330,6 +333,148 @@ class ClaimHeartbeat:
         return False
 
 
+# --------------------------------------------------------------- directory locks
+# A lock held across a long operation needs exactly what a shard claim needs: a liveness
+# signal, and a waiter that can tell "still working" from "died holding it". Round 3 built
+# that for shard claims and this is the same discipline applied to the sharding lock --
+# heartbeat while held, age-based takeover when it goes quiet, ages read from the shared
+# filesystem's clock rather than a local one.
+#
+# The alternative -- an unbounded `while not manifest.exists(): sleep(10)` -- deadlocks the
+# whole fleet on one dead process, and prints the fix rather than applying it. Sharding runs
+# straight after a multi-hour download, which is precisely when a run gets interrupted.
+
+SHARD_LOCK_POLL_S = 10.0
+# Only reachable if a holder is alive and heartbeating but never produces a manifest, since
+# a dead holder's lock is taken over after `stale_after_s`. Generous, because sharding the
+# largest arm is a long single-threaded pass; the point is that the wait is BOUNDED.
+SHARD_LOCK_MAX_WAIT_S = 24 * 3600.0
+
+
+def lock_age_s(lock: Path, now: float | None = None) -> float:
+    """Seconds since this lock was last heartbeated. inf if there is no lock."""
+    lock = Path(lock)
+    try:
+        mt = lock.stat().st_mtime
+    except OSError:
+        return float("inf")
+    if now is None:
+        now = fs_now(lock.parent)
+    return max(0.0, now - mt)
+
+
+def heartbeat_lock(lock: Path) -> None:
+    """Refresh a lock's mtime so waiters can see the holder is still alive."""
+    try:
+        os.utime(Path(lock), None)
+    except OSError:
+        pass
+
+
+class LockHeartbeat:
+    """Touch a directory lock while a long operation holds it.
+
+    Same contract as ClaimHeartbeat, and for the same reason: the holder is busy inside a
+    single long call and cannot signal liveness from the main thread.
+    """
+
+    def __init__(self, lock: Path, interval: float = 60.0):
+        self.lock, self.interval = Path(lock), interval
+        self._stop = threading.Event()
+        self._th = None
+
+    def __enter__(self):
+        def tick():
+            while not self._stop.wait(self.interval):
+                heartbeat_lock(self.lock)
+        self._th = threading.Thread(target=tick, daemon=True)
+        self._th.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._th is not None:
+            self._th.join(timeout=2.0)
+        return False
+
+
+def read_lock_owner(lock: Path) -> dict:
+    try:
+        return json.loads((Path(lock) / "owner.json").read_text())
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def break_lock(lock: Path) -> None:
+    """Remove a lock whose holder is gone. Safe to race: rmdir simply fails for the loser."""
+    lock = Path(lock)
+    try:
+        (lock / "owner.json").unlink()
+    except OSError:
+        pass
+    try:
+        lock.rmdir()
+    except OSError:
+        pass
+
+
+def acquire_dir_lock(lock: Path, done_when, owner: dict, stale_after_s: float,
+                     max_wait_s: float = SHARD_LOCK_MAX_WAIT_S, label: str = "lock",
+                     log=print) -> bool:
+    """Acquire `lock`, or wait for whoever holds it to finish.
+
+    Returns True  -> we hold the lock and must do the work (release it when done).
+            False -> `done_when()` became true while waiting; the work is already done.
+
+    Raises SystemExit if the wait exceeds `max_wait_s`, with the manual fix. A bounded wait
+    that fails loudly beats an unbounded one that only prints advice.
+    """
+    lock = Path(lock)
+    waited = 0.0
+    while True:
+        if done_when():
+            return False
+        try:
+            lock.mkdir()
+        except FileExistsError:
+            pass
+        else:
+            try:
+                atomic_write_text(json.dumps(owner, indent=2), lock / "owner.json")
+            except OSError:
+                pass
+            return True
+
+        age = lock_age_s(lock)
+        if age > stale_after_s:
+            who = read_lock_owner(lock)
+            log(f"[data] {label}: lock has not been heartbeated for {age / 60:.0f} min "
+                f"(stale after {stale_after_s / 60:.0f} min); its holder "
+                f"{who.get('host', '?')}/pid {who.get('pid', '?')} is presumed dead -- "
+                f"taking it over")
+            break_lock(lock)
+            continue                      # retry immediately; a racing waiter may win
+
+        if waited >= max_wait_s:
+            who = read_lock_owner(lock)
+            stop(f"{label}: waited {waited / 3600:.1f} h for "
+                 f"{who.get('host', '?')}/pid {who.get('pid', '?')} to finish and it is "
+                 f"still heartbeating but has produced nothing.\n"
+                 f"  The lock is {lock}.\n"
+                 f"  Either that process is stuck, or sharding this arm genuinely takes "
+                 f"longer than {max_wait_s / 3600:.0f} h.\n"
+                 f"  Check whether it is alive; if not, remove the lock directory and "
+                 f"re-run.")
+
+        if waited and waited % 600 < SHARD_LOCK_POLL_S:
+            who = read_lock_owner(lock)
+            log(f"[data] {label}: waiting for {who.get('host', '?')}/pid "
+                f"{who.get('pid', '?')} ({waited / 60:.0f} min; lock last seen "
+                f"{age:.0f}s ago, taken over after {stale_after_s / 60:.0f} min of silence)")
+        time.sleep(SHARD_LOCK_POLL_S)
+        waited += SHARD_LOCK_POLL_S
+
+
 def release_claim(job_output_dir: Path, si: int) -> None:
     """Drop a claim we could not complete, so another worker can pick the shard up."""
     cp = claim_path(job_output_dir, si)
@@ -479,169 +624,174 @@ def shard_arm(cfg: Config, arm_name: str, log=print, count_tokens: bool = False)
 
     # Multi-node: several nodes may reach this at once on a fresh data_root. Exactly one
     # should shard; the rest wait for the manifest rather than racing to write the same
-    # files. Atomic mkdir again, for the same reason claims use it.
+    # files. Atomic mkdir again, for the same reason claims use it -- and heartbeated and
+    # takeover-able, for the same reason claims are. See acquire_dir_lock.
     lock = out_dir / ".sharding.lock"
-    try:
-        lock.mkdir()
-        holder = True
-    except FileExistsError:
-        holder = False
-    if not holder:
-        log(f"[data] {a.name}: another process is sharding this arm; waiting for its "
-            f"manifest ...")
-        waited = 0
-        while not existing.exists():
-            time.sleep(10)
-            waited += 10
-            if waited % 600 == 0:
-                log(f"[data] {a.name}: still waiting ({waited // 60} min). If no other "
-                    f"process is running, remove {lock} and re-run.")
+    stale_after = float(cfg.cluster["compute"].get("claim_stale_after_s", 1800))
+    owner = {"host": HOSTNAME, "pid": os.getpid(), "arm": a.name,
+             "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if not acquire_dir_lock(lock, done_when=existing.exists, owner=owner,
+                            stale_after_s=stale_after, label=f"{a.name} sharding",
+                            log=log):
         log(f"[data] {a.name}: manifest appeared -> skip")
         return Manifest.from_json(existing.read_text())
 
-    try:
-        ds = _open_dataset(cfg, a, streaming=False)
-    except BaseException:
+    # We hold the lock and there is no manifest, so any part_*.parquet here is debris from
+    # a run that died before finishing. It cannot be reused -- without a manifest there is
+    # nothing that says how many shards there should be or what fingerprint they carry --
+    # and leaving it risks mixing two runs' output if the shard count ever differs.
+    debris = sorted(out_dir.glob("part_*.parquet")) + sorted(out_dir.glob("part_*.parquet.tmp"))
+    if debris:
+        log(f"[data] {a.name}: clearing {len(debris)} orphaned shard file(s) from an "
+            f"interrupted run")
+        for d in debris:
+            try:
+                d.unlink()
+            except OSError:
+                pass
+
+    # Heartbeat for as long as we hold the lock. Without this a long sharding pass -- and
+    # the largest arm is 126M documents -- would go quiet past the staleness threshold and
+    # another node would take the lock over while we are still writing, producing two
+    # processes sharding the same arm into the same directory.
+    with LockHeartbeat(lock, interval=min(60.0, stale_after / 5)):
         try:
-            lock.rmdir()
-        except OSError:
-            pass
-        raise
-    if col not in ds.column_names:
-        stop(f"{a.name}: no {col!r} column; columns are {ds.column_names}")
+            ds = _open_dataset(cfg, a, streaming=False)
+        except BaseException:
+            break_lock(lock)      # owner.json lives inside, so rmdir alone would fail
+            raise
+        if col not in ds.column_names:
+            stop(f"{a.name}: no {col!r} column; columns are {ds.column_names}")
 
-    # §3: doc_id is the join key back to the input corpus. If the dataset supplies one it
-    # is durable and independent of how this pipeline shards. If it does not, we synthesize
-    # a row index -- reproducible, but only meaningful relative to OUR sharding, which makes
-    # data_root/shards/ load-bearing forever. That difference is consequential enough to be
-    # a decision rather than a silent fallback.
-    has_doc_id = "doc_id" in ds.column_names
-    require = bool(sh.get("require_doc_id", True))
-    if not has_doc_id:
-        msg = (f"{a.name}: {cfg.hf_repo_id}/{a.subdir} has NO 'doc_id' column "
-               f"(columns: {ds.column_names}).\n"
-               f"  doc_id is the key that joins rewritten output back to the input corpus "
-               f"-- topic labels, quality scores, anything not carried in the 11-key output "
-               f"schema.\n"
-               f"  Without it this pipeline synthesizes a row index, which is deterministic "
-               f"but only meaningful relative to this sharding: data_root/shards/ then has "
-               f"to survive for the join to remain possible.\n"
-               f"  FIX (cheap, and permanent): add an explicit doc_id column to the dataset "
-               f"and re-upload.\n"
-               f"  OVERRIDE: set sharding.require_doc_id: false in configs/data.yaml to "
-               f"accept the synthesized index. That choice is recorded in the manifest.")
-        if require:
-            stop(msg)
-        log("[data] WARNING " + "-"*58)
-        for line in msg.splitlines():
-            log("[data] " + line)
-        log("[data] " + "-"*65)
-    ltok = None
-    if count_tokens:
-        from .engine import load_llama2_tokenizer
-        ltok = load_llama2_tokenizer(cfg)
-
-    running = hashlib.sha1()
-    total_rows = total_bytes = total_tok = 0
-    shards = []
-    shard_idx = 0
-    buf_ids, buf_txt, buf_sha = [], [], []
-    buf_bytes = 0
-
-    def flush():
-        nonlocal shard_idx, buf_ids, buf_txt, buf_sha, buf_bytes
-        if not buf_txt:
-            return
-        tbl = pa.table({
-            "doc_id": pa.array(buf_ids, type=pa.int64()),
-            col: pa.array(buf_txt, type=pa.large_string()),
-            "source_text_sha1": pa.array(buf_sha, type=pa.string()),
-        })
-        atomic_write_table(tbl, out_dir / f"part_{shard_idx:05d}.parquet")
-        shards.append({"index": shard_idx, "path": f"part_{shard_idx:05d}.parquet",
-                       "n_rows": len(buf_txt), "text_bytes": buf_bytes})
-        shard_idx += 1
-        buf_ids, buf_txt, buf_sha, buf_bytes = [], [], [], 0
-
-    log(f"[data] {a.name}: sharding "
-        f"(target {target_rows:,} rows / {target_bytes/2**20:.0f} MiB per shard)")
-
-    for batch in ds.select_columns(
-            [c for c in (col, "doc_id") if c in ds.column_names]).iter(batch_size=1000):
-        texts = batch[col]
-        ids = batch["doc_id"] if has_doc_id else None
+        # §3: doc_id is the join key back to the input corpus. If the dataset supplies one it
+        # is durable and independent of how this pipeline shards. If it does not, we synthesize
+        # a row index -- reproducible, but only meaningful relative to OUR sharding, which makes
+        # data_root/shards/ load-bearing forever. That difference is consequential enough to be
+        # a decision rather than a silent fallback.
+        has_doc_id = "doc_id" in ds.column_names
+        require = bool(sh.get("require_doc_id", True))
+        if not has_doc_id:
+            msg = (f"{a.name}: {cfg.hf_repo_id}/{a.subdir} has NO 'doc_id' column "
+                   f"(columns: {ds.column_names}).\n"
+                   f"  doc_id is the key that joins rewritten output back to the input corpus "
+                   f"-- topic labels, quality scores, anything not carried in the 11-key output "
+                   f"schema.\n"
+                   f"  Without it this pipeline synthesizes a row index, which is deterministic "
+                   f"but only meaningful relative to this sharding: data_root/shards/ then has "
+                   f"to survive for the join to remain possible.\n"
+                   f"  FIX (cheap, and permanent): add an explicit doc_id column to the dataset "
+                   f"and re-upload.\n"
+                   f"  OVERRIDE: set sharding.require_doc_id: false in configs/data.yaml to "
+                   f"accept the synthesized index. That choice is recorded in the manifest.")
+            if require:
+                stop(msg)
+            log("[data] WARNING " + "-"*58)
+            for line in msg.splitlines():
+                log("[data] " + line)
+            log("[data] " + "-"*65)
+        ltok = None
         if count_tokens:
-            total_tok += sum(len(x) for x in ltok(
-                [t or "" for t in texts], add_special_tokens=False).input_ids)
-        for k, t in enumerate(texts):
-            t = t or ""
-            h = sha1_text(t)
-            running.update(h.encode("ascii"))
-            nb = len(t.encode("utf-8"))
-            buf_ids.append(int(ids[k]) if ids is not None else total_rows)
-            buf_txt.append(t)
-            buf_sha.append(h)
-            buf_bytes += nb
-            total_rows += 1
-            total_bytes += nb
-            if len(buf_txt) >= target_rows or buf_bytes >= target_bytes:
-                flush()
-        if total_rows % 1_000_000 < 1000:
-            log(f"[data] {a.name}: {total_rows:,} rows, {shard_idx} shards")
-    flush()
+            from .engine import load_llama2_tokenizer
+            ltok = load_llama2_tokenizer(cfg)
 
-    content_sha1 = running.hexdigest()
-    doc_id_source = "dataset" if has_doc_id else "synthesized"
-    man = Manifest(
-        arm=a.name, repo_id=cfg.hf_repo_id, subdir=a.subdir, revision=cfg.hf_revision,
-        fingerprint=compute_fingerprint(cfg, content_sha1, doc_id_source),
-        total_rows=total_rows, total_text_bytes=total_bytes, content_sha1=content_sha1,
-        n_shards=len(shards), shards=shards,
-        total_tokens_llama2=(total_tok if count_tokens else None),
-        doc_id_source=doc_id_source,
-    )
+        running = hashlib.sha1()
+        total_rows = total_bytes = total_tok = 0
+        shards = []
+        shard_idx = 0
+        buf_ids, buf_txt, buf_sha = [], [], []
+        buf_bytes = 0
 
-    # Cross-check against the count data.yaml declares. A mismatch means the pinned
-    # revision is not the data these estimates were computed from -- which would make every
-    # disk and wall-clock number in the run wrong, silently.
-    if a.docs and total_rows != a.docs:
-        stop(f"{a.name}: downloaded {total_rows:,} rows but configs/data.yaml declares "
-             f"docs: {a.docs:,}.\n"
-             f"  Either hf.revision ({cfg.hf_revision[:12]}) is not the revision those "
-             f"numbers came from, or the arm's `docs` is stale.\n"
-             f"  Every token, disk and wall-clock estimate in this run derives from "
-             f"`docs` and `source_tokens_llama2`, so this is not a warning.")
+        def flush():
+            nonlocal shard_idx, buf_ids, buf_txt, buf_sha, buf_bytes
+            if not buf_txt:
+                return
+            tbl = pa.table({
+                "doc_id": pa.array(buf_ids, type=pa.int64()),
+                col: pa.array(buf_txt, type=pa.large_string()),
+                "source_text_sha1": pa.array(buf_sha, type=pa.string()),
+            })
+            atomic_write_table(tbl, out_dir / f"part_{shard_idx:05d}.parquet")
+            shards.append({"index": shard_idx, "path": f"part_{shard_idx:05d}.parquet",
+                           "n_rows": len(buf_txt), "text_bytes": buf_bytes})
+            shard_idx += 1
+            buf_ids, buf_txt, buf_sha, buf_bytes = [], [], [], 0
 
-    if True:
-        min_ratio = int(sh["min_shards_per_gpu"])
-        need = min_ratio * cfg.num_gpus
-        if man.n_shards < need:
-            # Do the arithmetic here rather than leaving it to be discovered: the useful
-            # output is the number to use, not the fact that the current one is wrong.
-            # At the shipped 5,000 rows/shard the smallest arm gives 6,677 shards, 67:1 at
-            # 100 GPUs, so this should not fire -- if it does, either num_gpus is far
-            # larger than planned or an arm is much smaller than data.yaml declares.
-            suggested = max(200, (total_rows // need) // 100 * 100)
-            stop(
-                f"{a.name}: only {man.n_shards} shards for {cfg.num_gpus} GPUs "
-                f"({man.n_shards / cfg.num_gpus:.1f}:1), below the required "
-                f"{min_ratio}:1.\n"
-                f"  A shard is the unit of work, so when shards barely outnumber workers "
-                f"the tail of every job leaves most GPUs idle.\n"
-                f"  This arm has {total_rows:,} rows and you have {cfg.num_gpus} GPUs, so "
-                f"it needs >= {need:,} shards.\n"
-                f"  SET configs/data.yaml sharding.shard_target_rows: {suggested}   "
-                f"(currently {target_rows})\n"
-                f"  Then delete {out_dir} and re-run 02_download_data.py.\n"
-                f"  DECIDE THIS BEFORE JOB 1: shard size feeds the manifest fingerprint, so "
-                f"changing it after generation starts invalidates every .done marker."
-            )
+        log(f"[data] {a.name}: sharding "
+            f"(target {target_rows:,} rows / {target_bytes/2**20:.0f} MiB per shard)")
+
+        for batch in ds.select_columns(
+                [c for c in (col, "doc_id") if c in ds.column_names]).iter(batch_size=1000):
+            texts = batch[col]
+            ids = batch["doc_id"] if has_doc_id else None
+            if count_tokens:
+                total_tok += sum(len(x) for x in ltok(
+                    [t or "" for t in texts], add_special_tokens=False).input_ids)
+            for k, t in enumerate(texts):
+                t = t or ""
+                h = sha1_text(t)
+                running.update(h.encode("ascii"))
+                nb = len(t.encode("utf-8"))
+                buf_ids.append(int(ids[k]) if ids is not None else total_rows)
+                buf_txt.append(t)
+                buf_sha.append(h)
+                buf_bytes += nb
+                total_rows += 1
+                total_bytes += nb
+                if len(buf_txt) >= target_rows or buf_bytes >= target_bytes:
+                    flush()
+            if total_rows % 1_000_000 < 1000:
+                log(f"[data] {a.name}: {total_rows:,} rows, {shard_idx} shards")
+        flush()
+
+        content_sha1 = running.hexdigest()
+        doc_id_source = "dataset" if has_doc_id else "synthesized"
+        man = Manifest(
+            arm=a.name, repo_id=cfg.hf_repo_id, subdir=a.subdir, revision=cfg.hf_revision,
+            fingerprint=compute_fingerprint(cfg, content_sha1, doc_id_source),
+            total_rows=total_rows, total_text_bytes=total_bytes, content_sha1=content_sha1,
+            n_shards=len(shards), shards=shards,
+            total_tokens_llama2=(total_tok if count_tokens else None),
+            doc_id_source=doc_id_source,
+        )
+
+        # Cross-check against the count data.yaml declares. A mismatch means the pinned
+        # revision is not the data these estimates were computed from -- which would make every
+        # disk and wall-clock number in the run wrong, silently.
+        if a.docs and total_rows != a.docs:
+            stop(f"{a.name}: downloaded {total_rows:,} rows but configs/data.yaml declares "
+                 f"docs: {a.docs:,}.\n"
+                 f"  Either hf.revision ({cfg.hf_revision[:12]}) is not the revision those "
+                 f"numbers came from, or the arm's `docs` is stale.\n"
+                 f"  Every token, disk and wall-clock estimate in this run derives from "
+                 f"`docs` and `source_tokens_llama2`, so this is not a warning.")
+
+        if True:
+            min_ratio = int(sh["min_shards_per_gpu"])
+            need = min_ratio * cfg.num_gpus
+            if man.n_shards < need:
+                # Do the arithmetic here rather than leaving it to be discovered: the useful
+                # output is the number to use, not the fact that the current one is wrong.
+                # At the shipped 5,000 rows/shard the smallest arm gives 6,677 shards, 67:1 at
+                # 100 GPUs, so this should not fire -- if it does, either num_gpus is far
+                # larger than planned or an arm is much smaller than data.yaml declares.
+                suggested = max(200, (total_rows // need) // 100 * 100)
+                stop(
+                    f"{a.name}: only {man.n_shards} shards for {cfg.num_gpus} GPUs "
+                    f"({man.n_shards / cfg.num_gpus:.1f}:1), below the required "
+                    f"{min_ratio}:1.\n"
+                    f"  A shard is the unit of work, so when shards barely outnumber workers "
+                    f"the tail of every job leaves most GPUs idle.\n"
+                    f"  This arm has {total_rows:,} rows and you have {cfg.num_gpus} GPUs, so "
+                    f"it needs >= {need:,} shards.\n"
+                    f"  SET configs/data.yaml sharding.shard_target_rows: {suggested}   "
+                    f"(currently {target_rows})\n"
+                    f"  Then delete {out_dir} and re-run 02_download_data.py.\n"
+                    f"  DECIDE THIS BEFORE JOB 1: shard size feeds the manifest fingerprint, so "
+                    f"changing it after generation starts invalidates every .done marker."
+                )
 
     atomic_write_text(man.to_json(), manifest_path(cfg, a.name))
-    try:
-        lock.rmdir()
-    except OSError:
-        pass
+    break_lock(lock)
     log(f"[data] {a.name}: {total_rows:,} rows, {len(shards)} shards, "
         f"{total_bytes/2**30:.1f} GiB text, doc_id={man.doc_id_source}, "
         f"content_sha1={content_sha1[:12]}")

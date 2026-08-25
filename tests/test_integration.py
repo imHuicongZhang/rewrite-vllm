@@ -573,6 +573,75 @@ expect('LOCK="$LOCK_DIR/.joblock"' not in rj,
 expect("progress_{HOST}_w{worker_id}.json" in (REPO / "src" / "rewrite" / "run_rewrite.py").read_text(),
        "1.3: progress filenames are node-qualified")
 
+# 1.5: the SHARDING lock recovers from a dead holder (round 6)
+# Before round 6 this deadlocked forever: `while not manifest.exists(): sleep(10)` with no
+# liveness check and no bound, so one killed process wedged every later run of the fleet.
+_arm6 = "disagreement-aware"
+_sd6  = cfg.shards_dir(_arm6)
+_lock6 = _sd6 / ".sharding.lock"
+_man6 = D.manifest_path(cfg, _arm6)
+_man_backup = _man6.read_text()
+
+def _plant_lock(age_s):
+    if _lock6.exists():
+        D.break_lock(_lock6)
+    _lock6.mkdir()
+    D.atomic_write_text(json.dumps({"host": "deadnode", "pid": 999999}),
+                        _lock6 / "owner.json")
+    if age_s:
+        t = D.fs_now(_sd6) - age_s
+        os.utime(_lock6, (t, t))
+
+# (a) a LIVE lock is respected: the waiter must not steal it, and must give up bounded
+_plant_lock(age_s=0)
+try:
+    D.acquire_dir_lock(_lock6, done_when=lambda: False, owner={"host": "me"},
+                       stale_after_s=9999, max_wait_s=0.0, label="t", log=lambda m: None)
+    _a = "returned"
+except SystemExit:
+    _a = "stopped"
+expect(_a == "stopped", "1.5: a LIVE sharding lock is NOT stolen; the wait is bounded and fails")
+expect(D.read_lock_owner(_lock6).get("host") == "deadnode",
+       "1.5: the live lock still belongs to its original holder")
+
+# (b) a STALE lock is taken over
+_plant_lock(age_s=5000)
+_got = D.acquire_dir_lock(_lock6, done_when=lambda: False, owner={"host": "me", "pid": 1},
+                          stale_after_s=1800, max_wait_s=60, label="t", log=lambda m: None)
+expect(_got is True, "1.5: a STALE sharding lock is taken over")
+expect(D.read_lock_owner(_lock6).get("host") == "me",
+       "1.5: the taker-over records itself as the new owner")
+D.break_lock(_lock6)
+
+# (c) if the work completes while waiting, the waiter returns False and does NOT shard
+_plant_lock(age_s=0)
+_got = D.acquire_dir_lock(_lock6, done_when=lambda: True, owner={"host": "me"},
+                          stale_after_s=9999, max_wait_s=0.0, label="t", log=lambda m: None)
+expect(_got is False, "1.5: waiter returns False when the manifest appears")
+D.break_lock(_lock6)
+
+# (d) END TO END: a stale lock plus a missing manifest must not hang shard_arm.
+#     This is the exact situation a killed run leaves behind.
+_man6.unlink()
+_plant_lock(age_s=5000)
+_t6 = _t.time()
+_m6 = D.shard_arm(cfg, _arm6, log=lambda m: None)
+_el6 = _t.time() - _t6
+expect(_m6.total_rows == ROWS[_arm6] and _el6 < 60,
+       f"1.5: shard_arm recovers from a stale lock instead of hanging ({_el6:.1f}s)")
+expect(not _lock6.exists(), "1.5: the lock is released when sharding finishes")
+expect(D.load_manifest(cfg, _arm6).total_rows == ROWS[_arm6],
+       "1.5: and the manifest it wrote is correct")
+
+# (e) orphaned shard files from the dead run are cleared, not mixed in
+_man6.unlink()
+_junk = _sd6 / "part_99999.parquet"
+_junk.write_bytes(b"not a parquet file")
+_plant_lock(age_s=5000)
+D.shard_arm(cfg, _arm6, log=lambda m: None)
+expect(not _junk.exists(), "1.5: orphaned shard files from an interrupted run are cleared")
+expect(D.load_manifest(cfg, _arm6).total_rows == ROWS[_arm6], "1.5: manifest still correct")
+
 # §2: the shard guard's arithmetic, and that the shipped default clears it at 100 GPUs
 # read the SHIPPED config, not the tiny override this test uses for its toy corpus
 _shipped = yaml.safe_load((REPO / "configs" / "data.yaml").read_text())["sharding"]
@@ -598,6 +667,18 @@ _total_shards = sum(-(-d // rows_per_shard) for d in _declared.values())
 expect(_total_shards < 70_000,
        f"2: {_total_shards:,} input shards across all arms (2000 rows would give "
        f"{sum(-(-d // 2000) for d in _declared.values()):,})")
+
+# 2.1: the GPU ceiling the sharding implies, and that the docs quote it correctly (round 6)
+_caps = {n: (-(-d // rows_per_shard)) // min_ratio for n, d in _declared.items()}
+_bind = min(_caps, key=lambda k: _caps[k])
+expect(_bind == "disagreement-aware" and _caps[_bind] == 333,
+       f"2.1: binding arm is {_bind} at {_caps[_bind]} GPUs (expected disagreement-aware/333)")
+for _doc in ("docs/GUIDE_FOR_TIANJIAN.md", "configs/data.yaml"):
+    _txt = (REPO / _doc).read_text()
+    expect("330" in _txt and "333" in _txt,
+           f"2.1: {_doc} states the ~330 GPU ceiling and its binding value")
+expect(-(-_declared[_bind] // rows_per_shard) == 6677,
+       "2.1: the arithmetic in the docs (6,677 shards) matches the config")
 
 # §3: doc_id provenance is recorded per arm, and the requirement is enforced
 for a in ARMS:

@@ -95,7 +95,7 @@ are expanded automatically, so `"${repo_root}/logs"` is a valid value.
 
 | key | how to determine it |
 |---|---|
-| `num_gpus` | `nvidia-smi --list-gpus \| wc -l`. Use every GPU you are entitled to — see §4 if the node is shared. |
+| `num_gpus` | `nvidia-smi --list-gpus \| wc -l`. Use every GPU you are entitled to — see §4 if the node is shared. **Hard ceiling: ~330. If you have more, stop and tell Wytro before running anything — see the box below.** |
 | `gpu_ids` | leave as `auto` (means `0..num_gpus-1`). Only set an explicit list like `[0,1,2,3]` if you must avoid specific cards. Its length must equal `num_gpus`. |
 | `cpu_workers` | `nproc`. Used only by the CPU trim stage; no GPU involved. |
 | `shard_assignment` | leave as `dynamic` — B300 is faster than B200; see §2.3. |
@@ -107,6 +107,30 @@ To see VRAM per GPU (you need ≥ 24 GiB per card):
 nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv
 ```
 
+> **⚠ The sharding caps this run at about 330 GPUs.**
+>
+> Every job's work is divided into shards, and `configs/data.yaml` requires at least
+> `min_shards_per_gpu: 20` shards per GPU so the tail of each job does not leave most of the
+> fleet idle. The smallest arm sets the limit:
+>
+> ```
+> max_gpus = ceil(docs / shard_target_rows) / min_shards_per_gpu     over the SMALLEST arm
+>
+>   disagreement-aware   33,381,230 docs / 5,000 =  6,677 shards / 20 =  333   <- binding
+>   diversity-oriented   35,304,301 docs / 5,000 =  7,061 shards / 20 =  353
+>   quality-first        37,511,431 docs / 5,000 =  7,503 shards / 20 =  375
+>   wrap-inspired        63,226,477 docs / 5,000 = 12,646 shards / 20 =  632
+>   rewire-inspired     126,480,544 docs / 5,000 = 25,297 shards / 20 = 1,264
+> ```
+>
+> **If `num_gpus` is at or under ~330, nothing to do.** `02_download_data.py` checks this and
+> tells you the exact number if it is exceeded.
+>
+> **If you have more than that, do not just set the number and start.** The only remedy is a
+> smaller `shard_target_rows`, and that changes the manifest fingerprint — which invalidates
+> every completed shard and means re-preparing all the data. It is cheap before job 1 and
+> expensive after. Tell Wytro your GPU count first; the value is his to change, not yours.
+
 ### 2.3 GPU architecture — this run is Blackwell only
 
 **All 10 jobs run on B200 (`sm_100`) and B300 / Blackwell Ultra (`sm_103`). H200 is
@@ -115,13 +139,28 @@ is enforced in code: `configs/data.yaml` carries `compute_constraints.allowed_gp
 `preflight.py` refuses to start on a disallowed card, and **every worker refuses on its
 own** — because preflight can be skipped and `03_run_job.sh` can be run directly.
 
-*Why.* The original data was generated on H100 (`sm_90`) using FlashAttention v3, which is
-Hopper-only; vLLM selects a different attention backend on Blackwell. Greedy decoding at
-`temperature=0` is **not** bitwise identical across architectures — an argmax can flip on a
-near-tie, and because generation is autoregressive the rest of that output diverges. If
-some arms ran on Hopper and others on Blackwell, arm-vs-arm differences would be confounded
-with GPU architecture, which is the exact comparison this experiment exists to make.
-Restricting every job to one architecture family removes the confound.
+*Why — one architecture family.* Greedy decoding at `temperature=0` is **not** bitwise
+identical across architectures: vLLM selects a different attention backend, an argmax can
+flip on a near-tie, and because generation is autoregressive the rest of that output
+diverges. If some arms ran on Hopper and others on Blackwell, arm-vs-arm differences would
+be confounded with GPU architecture — the exact comparison this experiment exists to make.
+Restricting every job to one family removes the confound. **This part is non-negotiable and
+is sufficient on its own.**
+
+*Why Blackwell specifically — throughput.* Roughly 2–3× Hopper on this workload. That is
+the whole of it: a cost decision, not a fidelity one.
+
+*What that costs, stated plainly.* The 1.5B corpora were generated on H100 (`sm_90`) with
+FlashAttention v3, which is Hopper-only. H100 and H200 are both `sm_90` and share that
+path, so **H200 is actually the architecture closest to how the source data was produced** —
+excluding it moves this run *further* from the source's numerics, not nearer. That is
+accepted: this run is **not** numerically continuous with the 1.5B run, and it never could
+have been across a GPU generation change (the vLLM version differs too). Cross-scale
+comparability rests on matching prompts, budgets and selection procedure — all verified —
+not on bitwise-identical generation. Either way, every shard records the card that produced
+it (`gpu_cc` in its `.done` sidecar).
+
+If you are ever weighing a hardware swap, weigh it against *those* reasons.
 
 **What you have to do.** If the node has non-Blackwell cards, select only the Blackwell
 ones:

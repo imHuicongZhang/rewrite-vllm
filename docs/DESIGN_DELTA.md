@@ -179,9 +179,16 @@ values live per style in `prompt_defs.wrap_styled.styles[*].expected_overhead`, 
 are config-visible rather than one standing in for four. The sidecar records a dict of the
 four rather than a single integer for that job.
 
-**`scripts/preflight.py` check 6.** Loops the same `overheads()` expansion and reports
-`n_texts` explicitly — 6 distinct texts across 10 jobs — so a silent collapse to one text
-per job would show up as a changed count.
+**`scripts/preflight.py` check 6.** Loops the same `overheads()` expansion and reports the
+count explicitly, so a silent collapse to one text per job would show up as a changed number.
+Two counts are involved and they are easy to conflate — the header comment in `preflight.py`
+drifted for exactly that reason and was corrected in round 6:
+
+- **13** = `(job, template)` pairs asserted — 9 grounded jobs × 1 + the styled pass × 4.
+- **6** = distinct prompt *texts* — the four grounded arms share `p1`, all five share `p2`,
+  plus the four wrap styles.
+
+Both are printed.
 
 **`scripts/verify_prompt_parity.py`.** Runs standalone from the YAML without
 `config.py`'s loader, so it needed its own expansion: a `_units()` helper yields four

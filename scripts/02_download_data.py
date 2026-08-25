@@ -33,6 +33,10 @@ def main(argv=None) -> int:
     ap.add_argument("--arm", default=None, help="only this arm (default: all five)")
     ap.add_argument("--count-tokens", action="store_true",
                     help="also count Llama-2 tokens (an extra full pass)")
+    ap.add_argument("--wait-timeout-s", type=float, default=24 * 3600,
+                    help="give up waiting for manifests after this long (--wait-only). "
+                         "Bounded on purpose: an unbounded wait cannot be told apart from "
+                         "a hung run.")
     ap.add_argument("--wait-only", action="store_true",
                     help="do not download or shard; just wait until every arm's manifest "
                          "exists. For worker nodes in a multi-node run, where one node "
@@ -46,12 +50,33 @@ def main(argv=None) -> int:
         import time as _t
         pending = list(arms)
         waited = 0
+        # Bounded, for the same reason the sharding lock is: a worker node that waits
+        # forever on a preparing node that died looks identical to one that is working.
+        # The preparing node holds a heartbeated lock per arm, so "no lock and no manifest"
+        # means nobody is preparing this arm -- report that rather than sleeping on it.
+        limit = int(args.wait_timeout_s)
         while True:
             missing = [a.name for a in pending if not D.manifest_path(cfg, a.name).exists()]
             if not missing:
                 break
+            if waited >= limit:
+                idle = [n for n in missing
+                        if not (cfg.shards_dir(n) / ".sharding.lock").exists()]
+                print(f"\n*** STOP: waited {waited / 3600:.1f} h for manifests and "
+                      f"{len(missing)} arm(s) are still missing: {missing}",
+                      file=sys.stderr)
+                if idle:
+                    print(f"  {idle} have no .sharding.lock either, so NO process is "
+                          f"preparing them. The node that was meant to run "
+                          f"02_download_data.py has probably died.", file=sys.stderr)
+                print(f"  Run 02_download_data.py (without --wait-only) on one node, or "
+                      f"raise --wait-timeout-s if data prep genuinely takes longer.",
+                      file=sys.stderr)
+                return 2
             if waited % 300 == 0:
-                print(f"[data] waiting for manifests: {missing} ({waited // 60} min)",
+                held = {n: (cfg.shards_dir(n) / ".sharding.lock").exists() for n in missing}
+                print(f"[data] waiting for manifests: {missing} ({waited // 60} min); "
+                      f"being prepared now: {[n for n, v in held.items() if v]}",
                       flush=True)
             _t.sleep(15)
             waited += 15

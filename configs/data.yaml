@@ -93,13 +93,30 @@ semantics:
 # All 10 jobs run on Blackwell only: B200 (sm_100) and B300 / Blackwell Ultra (sm_103).
 # H200 (Hopper, sm_90) is deliberately EXCLUDED even if present on the node.
 #
-# Why this is enforced in code rather than written in a README: the source data was
-# generated on H100 with FlashAttention v3, which is Hopper-only, and vLLM selects a
-# different attention backend on Blackwell. Greedy decoding at temperature=0 is not
-# bitwise identical across architectures -- an argmax can flip on a near-tie and the rest
-# of that generation diverges. Mixing Hopper and Blackwell across the 10 jobs would
-# confound "which arm" with "which GPU", which is exactly the comparison the experiment
-# exists to make. Restricting to one architecture family removes the confound entirely.
+# THE REASON, stated correctly. An earlier version of this comment argued that Blackwell
+# was chosen to stay close to the source data. That is backwards, and anyone deciding
+# whether to swap hardware later needs the real reason rather than one that points the
+# wrong way:
+#
+#   1. ONE ARCHITECTURE FAMILY ACROSS ALL TEN JOBS. Non-negotiable, and sufficient on its
+#      own. Greedy decoding at temperature=0 is not bitwise identical across architectures
+#      -- vLLM selects a different attention backend, and an argmax can flip on a near-tie
+#      after which that generation diverges. Mixing families across the ten jobs would
+#      confound "which arm" with "which GPU", which is exactly the comparison this
+#      experiment exists to make. Restricting to one family removes the confound entirely.
+#
+#   2. BLACKWELL CHOSEN FOR THROUGHPUT -- roughly 2-3x Hopper on this workload. That is
+#      the whole of the reason it is Blackwell rather than Hopper. It is a cost decision,
+#      not a fidelity one.
+#
+#   3. THE ACCEPTED COST. The 1.5B corpora were generated on H100 with FlashAttention v3,
+#      which is Hopper-only. H100 and H200 are both sm_90 and share that path, so H200 is
+#      in fact the architecture CLOSEST to how the source data was produced -- excluding it
+#      moves this run further from the source's numerics, not nearer. We accept that: this
+#      run is NOT numerically continuous with the 1.5B run, and it was never going to be
+#      across a GPU generation change (the vLLM version differs too). Cross-scale
+#      comparability rests on matching prompts, budgets and selection procedure -- all of
+#      which are verified -- not on bitwise-identical generation.
 #
 # B200 and B300 are both Blackwell, so they share an attention backend and their numerics
 # are close; the residual difference between sm_100 and sm_103 is accepted, and every
@@ -167,6 +184,28 @@ sharding:
   # reason that still holds: num_gpus lives in Tianjian's cluster.yaml, while shard size
   # feeds the fingerprint. Deriving one from the other would let a machine-local setting
   # silently renumber doc_id.
+  #
+  # ---------------------------------------------------------------------------------
+  # THIS CAPS THE RUN AT ~330 GPUs. Check the fleet size against it BEFORE job 1.
+  #
+  #   max_gpus = ceil(docs / shard_target_rows) / min_shards_per_gpu,
+  #              taken over the SMALLEST arm, which is the binding one
+  #
+  #     arm                        docs    shards @5000   max GPUs
+  #     disagreement-aware   33,381,230           6,677        333   <- binding
+  #     diversity-oriented   35,304,301           7,061        353
+  #     quality-first        37,511,431           7,503        375
+  #     wrap-inspired        63,226,477          12,646        632
+  #     rewire-inspired     126,480,544          25,297      1,264
+  #
+  # Above ~333 GPUs, 02_download_data.py refuses to shard disagreement-aware and prints
+  # the shard_target_rows to use instead. The remedy is re-sharding, which changes the
+  # manifest fingerprint and therefore invalidates every .done marker -- i.e. in practice
+  # it means re-preparing the data from scratch. Decide before job 1.
+  #
+  # Re-derive rather than re-guess if anything changes: a different min_shards_per_gpu, a
+  # different shard_target_rows, or an arm whose doc count moves all shift this number.
+  # ---------------------------------------------------------------------------------
   shard_target_rows: 5000
 
   # Secondary cap, so one run of very long documents cannot become a multi-hour shard.
