@@ -1758,3 +1758,296 @@ doc_id disjointness check remain unimplemented by decision.
 | 1 | Cut `rewire-inspired` to its 30B budget with the fastText fill — it ships ~99.5B **unfiltered** | Wytro |
 | 2 | Trim every arm's output to 30B and assemble `20B core + 30B rewritten = 50B` per arm | Wytro |
 | 3 | Read `06_calibrate.py`'s tok/doc cross-check on job 1: it settles the `r` transfer, and `quality-first`'s +19.6% headroom is the number at risk | Wytro |
+
+---
+
+# Addendum — 2026-08-26: round 7, scope reduction and fleet realism
+
+The last round. Four items plus one string, and one theme running through three of them:
+**the fleet is ~25 nodes × 4 GPUs, not one node with ~100 GPUs**, and several things in this
+repo were written as if `num_gpus` were the fleet total. **Nothing on the generation path
+was touched** — `prompts/`, `engine.py`, `run_rewrite.py`, `postprocess.py`, `shuffle.py`,
+`wrap_styles.py`, `configs/vllm.yaml`, `03_run_job.sh` and the shard-claim machinery are
+byte-identical to round 6, verified by diff.
+
+## §1 Upload is out of scope — DISABLED, and the placeholder deleted
+
+**Disposition: done. `upload.enabled: false` ships as the default, the `WYTRO` placeholder
+is gone rather than replaced, and the flag/config pair is made non-contradictory by
+construction. `05_upload_to_hf.py` stays in the repo, working and off.**
+
+**A note on the two bullets, which could not both be taken literally.** "Delete the
+placeholder" and "make `check_placeholders.py` exempt `upload.repo_template` when upload is
+disabled" are in tension: that script is a pure `<<<CLASS: …>>>` text scanner, so once the
+marker is deleted there is nothing left for an exemption to act on. Implemented as **delete
+the marker, and replace the exemption with the rule that actually protects**:
+`check_placeholders.py` now reads `upload.enabled` and `upload.repo_template` (stdlib regex
+only — it still has no third-party imports, because it runs before the environment exists)
+and fails **only** when `enabled: true` meets a blank template. Same rule stated positively,
+and it also covers the "enabled with nothing to upload to" case at the earliest gate.
+
+**The blocker was worse than the docs said, and that is worth recording.** `load_config`
+runs `assert_no_placeholders(data, …)` on *every* entry point, and in `preflight.py` that
+call sits **outside** the per-check `try`. So the unfilled `repo_template` did not block
+"upload only (step 6)" as `DESIGN_DELTA.md:627` and this document's own round-6 readiness
+list both claimed — it aborted preflight at check 2 with exit 2, no summary and no
+remaining checks, and equally killed `01_download_model.py`, `02_download_data.py`,
+`04_postprocess.py`, `06_calibrate.py` and `run_rewrite.py`. `--skip-upload` could not get
+past it. A blank documented as affecting the last step in fact blocked the first. Both
+claims are corrected.
+
+**What was built:**
+
+- `configs/data.yaml` — `enabled: false`, `repo_template: ""`. The comment says explicitly
+  that the emptiness is deliberate and why a plausible-looking id would be worse.
+- `config.py` — the single choke point. `enabled` must be a bool; `enabled: true` with a
+  blank template is a named `stop()`; so is a template missing `{arm}`/`{prompt_id}`, which
+  would have pushed all ten jobs to one repo, each overwriting the last.
+- `run_all.sh` — exports `UPLOAD_ENABLED` from the validated loader. Upload runs iff
+  `UPLOAD_ENABLED && !SKIP_UPLOAD`. **Both are veto-only: neither can switch upload on when
+  the other says off**, which is the whole reconciliation — they cannot contradict each
+  other because there is no combination in which they disagree about the outcome.
+  `--skip-upload` is kept, accepted, and reported honestly ("disabled in configs/data.yaml"
+  rather than claiming the flag did it).
+- `05_upload_to_hf.py` — refuses with a named `stop()` when disabled, **including under
+  `--dry-run`**: a dry run that cheerfully reports what it would push is the wrong answer
+  when nothing should be pushed. It prints the real output path instead.
+- `preflight.py` check 8 — skips the write-scope probe and namespace check when upload is
+  disabled, removing a warning about a token nobody needs.
+- `.env.example` — `HF_TOKEN_WRITE`'s marker removed, left blank. It mattered:
+  `.env.example` is exempt from the scan but Tianjian's copied `.env` is not, so the marker
+  would have failed his checker for a token with no use.
+
+**Result: zero `WYTRO` blanks remain.** `check_placeholders.py` on a clean checkout now
+reports only Tianjian's eleven.
+
+## §2 `model_dir` — NODE-LOCAL, decided on the arithmetic
+
+**Disposition: decided, documented, and made safe either way. Node-local, by more than an
+order of magnitude.**
+
+At 25 nodes × 4 GPUs:
+
+| | shared `model_dir` | node-local |
+|---|---|---|
+| per job start | 100 processes × 14.2 GiB ≈ **1.4 TiB** off the shared filesystem | local disk; 4 processes share one page cache |
+| over 10 jobs | ≈ **14 TiB** in ten bursts, each competing with `data_root` reads and `out_root` writes | 0 |
+| one-time cost | 1 × 14.2 GiB from the Hub | 25 × 14.2 GiB ≈ 355 GB, once |
+| disk | 20 GiB once | 20 GiB per node — already what `cluster.yaml` asks for |
+
+The one-time re-download is cheap and the local disk was already provisioned. The scarce
+resource is shared-filesystem bandwidth during a run that also streams input shards and
+writes output, and sharing the model spends it ten times for nothing. `hf_cache` follows
+`model_dir` for the same reason; its suggested default is now `${model_dir}/hf_cache`.
+
+**The role sequence needed no new step.** `run_all.sh` already runs `01_download_model.py`
+in *every* role including `--generate-only` (it sits outside the `DO_PREPARE` guard), so
+each node fetches its own copy at the start of step 2. That was already correct for
+node-local; what was missing was anyone saying so. The guide now does, and explains that
+step 1's download covers only the node it ran on.
+
+**`01_download_model.py` is now safe to run concurrently on many nodes**, which it was not.
+The download is wrapped in the round-6 heartbeated directory lock (`acquire_dir_lock` +
+`LockHeartbeat` + `break_lock` on both exit paths). Uncontended and free when `model_dir` is
+node-local; correct if someone points it at shared storage anyway. This also closes a real
+TOCTOU: `_verify_model` checks only that shard *filenames* exist, not their size or hash, so
+a second node could observe another node's in-flight file and declare the copy complete.
+
+## §3 Per-job postprocess parallelism — IMPLEMENTED. The reasoning in the report is right.
+
+**Disposition: built. The single-node rule was correct per job and too broad across jobs,
+exactly as reported.**
+
+Verified against the code rather than assumed. Per job: output dir is
+`out_root/shuffled/<arm>/<prompt_id>`, bucket dir is `tmp_root/_shuffle/<arm>/<prompt_id>`
+and `tmp_root` is node-local, trim's in-place target is `out_root/raw/<arm>/<prompt_id>`,
+the arm manifest is read-only. Nothing shared across jobs — **with one exception the report
+did not name**: `manifests/postprocess_summary.json` was rewritten whole at the end of every
+invocation, containing only the jobs *that* invocation ran. Two nodes, or even one
+`--arm`-scoped run, erased everyone else's entries.
+
+**What was built:**
+
+- `data.py` — `try_dir_lock(lock, owner, stale_after_s, label)`, the non-blocking sibling of
+  `acquire_dir_lock`, reusing `lock_age_s` / `break_lock` / `read_lock_owner` unchanged. The
+  distinction matters: sharding an arm *must* happen, so a loser there should wait;
+  postprocess is ten independent jobs, so a loser should go do a different one. A node that
+  blocked for up to 24 h on a job someone else was already shuffling would sit idle while
+  eight other jobs went untouched.
+- `04_postprocess.py` — a sweep that takes any free job, holds its lock under
+  `LockHeartbeat` for trim+shuffle, releases on **both** exits (`shuffle_job` raises on a
+  row-count mismatch, and a lock left behind there would make every other node wait out the
+  full stale timeout), and repeats until a whole pass takes nothing. Not a single pass — a
+  node that finishes a job after two hours should pick up whatever freed up meanwhile. Not
+  an unbounded wait either — 25 nodes blocking on 10 jobs would leave most of them asleep.
+- Per-job summary files under `manifests/postprocess/`, merged into the rollup. **The merge
+  is deliberately not `atomic_write_text`**: that helper writes through a fixed `<dest>.tmp`,
+  which is right for the one-writer-per-destination paths it was built for but makes two
+  nodes collide on a single temp name, and the loser's `os.replace` fails with ENOENT. This
+  was found by the test, not by reading. Unique temp name per writer, and a failure there is
+  swallowed with a note — losing a completed job's result because the convenience rollup
+  raced would be absurd.
+- `run_all.sh --postprocess-only` accepts and forwards `--arm` / `--prompt-id`, and refuses
+  them without `--postprocess-only` (on a full run they would silently mean "generate all
+  ten jobs, then postprocess one", which nobody wants). **That refusal was also found by a
+  test** — the first implementation keyed off `DO_POST`, which is 1 on a normal run.
+
+**Stated honestly in the guide: there are only 10 jobs, so this caps at 10 nodes** — about
+10× rather than 25×, and the floor on wall clock is the single largest job,
+`rewire-inspired/p1` at 126.5 M rows, which cannot be split further.
+
+Demonstrated at 2, 4 and 10 concurrent processes: no job run twice, all ten covered, every
+node contributing; at 10 nodes it is a clean 1:1 partition.
+
+## §4 The GPU ceiling cannot fire — DOCUMENTED TRUTHFULLY, and a real check added
+
+**Disposition: the report is exactly right. `min_shards_per_gpu × cfg.num_gpus` with
+`num_gpus` per node is 6,677 vs 4 → 1,669:1, and the fleet-wide ratio was examined by
+nothing. Documentation corrected in four places; an optional real check added.**
+
+`configs/data.yaml`'s box, `data.py`'s comment and error message, and the guide's §2.2 row,
+warning box and troubleshooting row all now say the same true thing: **the ceiling is a
+constraint on the fleet total, the automatic check sees one node, and with
+`compute.fleet_gpus` unset nobody but a human is checking.** The arithmetic is given in the
+form Tianjian can apply to whatever count he ends up with:
+
+```
+shards(smallest arm) / min_shards_per_gpu  =  6,677 / 20  =  333 GPUs   (fleet total)
+```
+
+— and, in his terms, ≈83 nodes at 4 GPUs each.
+
+**The cheap check, shipped:** optional `compute.fleet_gpus`, null by default. When set,
+`shard_arm` additionally requires `n_shards >= min_shards_per_gpu × fleet_gpus` and logs the
+fleet-wide ratio; when null it emits a NOTE saying the fleet ceiling was *not* checked.
+`config.py` validates it as a positive int or null, and rejects a `fleet_gpus` smaller than
+this node's `num_gpus` — a total can never be less than one node's share. No behaviour
+change for anyone who leaves it unset, which is the single-node case where `num_gpus`
+already *is* the fleet.
+
+*Rejected:* deriving the count from distinct claim owners. It only reads after generation
+starts, undercounts idle nodes, and needs a scan of every claim directory — for a number
+Tianjian already knows.
+
+## §5 `wrap-inspired p4` — FIXED
+
+**Disposition: one word.** `docs/POSTPROCESSING.md:196`, `p4` → `p1`. The styled four-style
+pass is p1 (`configs/data.yaml`); `p4` was four-pass-design naming. The other `p1..p4`
+mentions in `DESIGN_DELTA.md` and this file are historical references to the abandoned
+design and the source's own filenames, and are correct as they stand.
+
+## §6 The `num_gpus` audit — a pattern, and it was five sites, not three
+
+**Disposition: asked for during planning, and it found more than expected. All five
+corrected.**
+
+`06_calibrate.py` was four of the five, and its whole projection block derives from one
+multiply:
+
+| site | what it did |
+|---|---|
+| `data.py` ceiling guard | §4 above |
+| `06_calibrate.py` `fleet    :` line | **printed the literal word "fleet" for one node's 4 GPUs** |
+| `06_calibrate.py` per-job WALL column | every row ~25× too long |
+| `06_calibrate.py` `PROJECTED TOTAL` | the day-zero projection ~25× too pessimistic |
+| `06_calibrate.py` sensitivity block | inherits `total_h`, so all three rows too |
+
+Calibration runs on one node and single-node throughput is the honest thing for it to
+report, so the fix is labelling, not arithmetic: `this node:` instead of `fleet    :`,
+`WALL/NODE`, `ON THIS NODE` on the total, and a short table showing what 1 / 5 / 10 / 25
+nodes would mean. Nothing that could change a measured number was touched.
+
+**Verified per-node and left alone:** `config.py` (`gpu_ids: auto`, validation),
+`03_run_job.sh` (spawns N workers on this box), `preflight.py` device-count check, KV-cache
+estimate and Blackwell remedy text, and the test fixture.
+
+**Reported, not fixed:** `run_all.sh` exports `NGPU` and nothing in that file reads it
+(`03_run_job.sh` computes its own). Dead, harmless, and not worth touching the config
+bootstrap for.
+
+## §7 `out_root` was gated below its real requirement
+
+**Disposition: fixed, both halves, on instruction. Not cosmetic.**
+
+Three statements disagreed: the guide said `out_root` needs ~0.34 TiB, `cluster.yaml` said
+~0.7 TB, and `preflight.py` gated on the 0.34 figure. `cluster.yaml` was right — the trim
+runs in place, so `raw/` is never consumed and `shuffled/` is a second full copy. Both are
+present at rest.
+
+The gate mattered more than the prose. It passed a disk that then fills part-way through a
+shuffle, and `bucketed_shuffle` unlinks bucket files as it consumes them, so a disk-full
+there loses that job's entire shuffle — days into the run, at the worst possible moment.
+The guide's own "Disk full mid-run" row promised "recovery is clean by construction", which
+is true for generation and **false for the shuffle**; that row is corrected too.
+`preflight.py` now requires `2 * comp` in `out_root` and prints both figures.
+
+## §8 What was and was not executed
+
+**Ran, green:** `test_integration.py` — all pre-existing checks plus **28 new ones**
+(§4 upload ×11, §5 locking ×15 including a two-node sweep partition, §6 per-node and
+`fleet_gpus` enforcement ×13); `test_wrap_styles` 33/33; `compileall` over `src scripts
+tests`; all three YAML configs parse; `bash -n` on every shell script and the sbatch;
+`run_all.sh --help`; the `run_all.sh` argparse block round-tripped through the marker
+extraction across 12 invocation forms; `check_placeholders.py` in all four upload states;
+`05_upload_to_hf.py --dry-run` refusing cleanly. Separately, `04_postprocess.py`'s real
+`sweep()` driven from 2, 4 and 10 concurrent OS processes, and the summary merge from 5
+concurrent writers over 3 trials.
+
+**The pre-existing round-6 ceiling test (`test_integration.py` §2.1) passes unmodified.**
+It asserts both `docs/GUIDE_FOR_TIANJIAN.md` and `configs/data.yaml` still contain `330`
+and `333` and that the 6,677 arithmetic matches the config — the §4 rewrite changes what
+the number *means*, not the number.
+
+**Not run:** `test_trim_parity` and `test_shuffle_parity` — both require `--source-root`,
+the original pipeline tree, which is not present on this machine. `preflight.py` end to end
+and `verify_prompt_parity.py` — both need filled cluster paths. No GPU work. Note the
+round-6 entry claimed the two parity suites green; they were not re-run this round, and
+nothing they cover was touched (`postprocess.py` and `shuffle.py` have zero diff).
+
+**Untouched, and verified untouched by `git diff --stat`:** `prompts/`, `engine.py`,
+`run_rewrite.py`, `postprocess.py`, `shuffle.py`, `wrap_styles.py`, `configs/vllm.yaml`,
+`02_download_data.py`, `03_run_job.sh`, `00_setup_env.sh`, `verify_prompt_parity.py`.
+`data.py`'s diff is exactly two hunks — the new `try_dir_lock`, and the ceiling guard inside
+`shard_arm`; the shard-claim functions and `acquire_dir_lock` are unchanged. Engine args,
+sampling params, prompts, trim rules, shuffle, claiming and reaping are as round 6 left
+them. The ReWire budget fill and the doc_id disjointness check remain unimplemented by
+decision.
+
+## §9 Readiness list — final handoff form
+
+**Wytro, in order:**
+
+| # | item | blocks |
+|---|---|---|
+| 1 | **Grant Tianjian's HF account access to `wytro/Know-Your-Sources-7B`** (it is `gated: manual`) | everything — it is the input |
+| 2 | Confirm Tianjian's **fleet-total** GPU count is ≤ ~330, or decide a new `shard_target_rows` **before job 1** | everything, if exceeded |
+| 3 | Optional: push the `configs:` block from `data_reports/DATASET_CARD_DRAFT.md` to the Hub card | nothing |
+| 4 | Optional: fix `blab-jhu/KYS-Configs` shipping two different distill files | nothing here |
+
+*The output repo template and `HF_TOKEN_WRITE` are gone from this list. Upload is out of
+scope; there is nothing left for Wytro to fill before Tianjian can start.*
+
+**Tianjian, in order, after Wytro's 1:**
+
+| # | item | blocks |
+|---|---|---|
+| 1 | `bash scripts/00_setup_env.sh`, then paste the printed line into `env.activate_cmd` | everything |
+| 2 | Fill the 11 blanks in `configs/cluster.yaml`; `cp .env.example .env` and fill `HF_TOKEN` only | everything |
+| 3 | **If on more than one node:** set `compute.fleet_gpus` to the fleet total, and put `model_dir`, `hf_cache` and `tmp_root` on node-local disk (GUIDE §3.5) | correctness of the GPU-ceiling check; shared-filesystem load |
+| 4 | `python scripts/check_placeholders.py` — must report zero unresolved | everything |
+| 5 | `python scripts/preflight.py` — must pass; check 7 proves gated read access, check 9 prints the disk estimate (~0.65 TiB in `out_root`) | everything |
+| 6 | `bash scripts/run_all.sh` — model → data → calibrate → 10 jobs → postprocess. On several nodes, GUIDE §3.5 instead | — |
+
+**The run ends there.** Finished data is at
+`out_root/shuffled/<arm>/<prompt_id>/part_NNNNN.parquet` — 10 directories, ~1,184 zstd
+parquet files, ~592 M rows, ≈0.3 TiB. Nothing is uploaded and there is no further step.
+GUIDE §3.6.
+
+**After generation, before the corpus is trained on:**
+
+| # | item | owner |
+|---|---|---|
+| 1 | Cut `rewire-inspired` to its 30B budget with the fastText fill — it ships ~99.5B **unfiltered** | Wytro |
+| 2 | Trim every arm's output to 30B and assemble `20B core + 30B rewritten = 50B` per arm | Wytro |
+| 3 | Read `06_calibrate.py`'s tok/doc cross-check on job 1: it settles the `r` transfer, and `quality-first`'s +19.6% headroom is the number at risk | Wytro |
+| 4 | Arrange delivery of the finished data — out of this pipeline's scope by design | Wytro |

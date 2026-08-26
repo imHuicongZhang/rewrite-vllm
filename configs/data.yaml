@@ -171,6 +171,7 @@ sharding:
   # and every candidate passes with room. Recomputed against the real counts:
   #
   #   rows    input shards   output files   smallest arm   ratio @100 GPU   tail
+  #                                                          (fleet-wide GPU count)
   #    2000       147,955        591,820         16,691         167:1       ~2 min
   #    5000        59,184        236,736          6,677          67:1       ~6 min  <- chosen
   #   10000        29,594        118,376          3,339          33:1      ~11 min
@@ -186,22 +187,36 @@ sharding:
   # silently renumber doc_id.
   #
   # ---------------------------------------------------------------------------------
-  # THIS CAPS THE RUN AT ~330 GPUs. Check the fleet size against it BEFORE job 1.
+  # THIS CAPS THE RUN AT ~330 GPUs ACROSS THE WHOLE FLEET. Check it BEFORE job 1.
   #
   #   max_gpus = ceil(docs / shard_target_rows) / min_shards_per_gpu,
   #              taken over the SMALLEST arm, which is the binding one
   #
-  #     arm                        docs    shards @5000   max GPUs
+  #     arm                        docs    shards @5000   max GPUs (fleet total)
   #     disagreement-aware   33,381,230           6,677        333   <- binding
   #     diversity-oriented   35,304,301           7,061        353
   #     quality-first        37,511,431           7,503        375
   #     wrap-inspired        63,226,477          12,646        632
   #     rewire-inspired     126,480,544          25,297      1,264
   #
-  # Above ~333 GPUs, 02_download_data.py refuses to shard disagreement-aware and prints
-  # the shard_target_rows to use instead. The remedy is re-sharding, which changes the
-  # manifest fingerprint and therefore invalidates every .done marker -- i.e. in practice
-  # it means re-preparing the data from scratch. Decide before job 1.
+  # WHAT ACTUALLY CHECKS THIS, STATED HONESTLY. The automatic check in data.py's
+  # shard_arm() compares the shard count against cluster.yaml compute.num_gpus -- and
+  # num_gpus is PER NODE. On a multi-node fleet it therefore sees one node's share and
+  # nothing else. At ~4 GPUs per node it compares 6,677 shards against 4 and passes at
+  # 1,669:1, which tells you nothing about a fleet that might be 400 GPUs.
+  #
+  #   => The per-node check CANNOT enforce this ceiling on a multi-node run.
+  #   => Set cluster.yaml compute.fleet_gpus (optional, null by default) and it becomes a
+  #      real check against the fleet total. That is the only automatic enforcement there
+  #      is.
+  #   => With fleet_gpus unset, nobody but a human is checking. The arithmetic to do by
+  #      hand, for whatever GPU count you end up with:
+  #
+  #        shards(smallest arm) / min_shards_per_gpu  =  6,677 / 20  =  333 GPUs
+  #
+  # Above ~333 GPUs the remedy is a smaller shard_target_rows, which changes the manifest
+  # fingerprint and therefore invalidates every .done marker -- i.e. in practice it means
+  # re-preparing the data from scratch. Cheap before job 1, expensive after.
   #
   # Re-derive rather than re-guess if anything changes: a different min_shards_per_gpu, a
   # different shard_target_rows, or an arm whose doc count moves all shift this number.
@@ -213,7 +228,8 @@ sharding:
 
   # Shards must comfortably outnumber workers or the tail of each job idles the fleet.
   # The source ran 200 shards over 8 workers (25:1). 02_download_data.py refuses below
-  # this and tells you what to set shard_target_rows to.
+  # this and tells you what to set shard_target_rows to -- but see the ceiling box above:
+  # it measures against this NODE's num_gpus unless compute.fleet_gpus is set.
   min_shards_per_gpu: 20
 
   # doc_id is the key that joins rewritten output back to the input corpus, and the key
@@ -275,8 +291,23 @@ postprocess:
   in_place: true
 
 upload:
-  # One repo per (arm, prompt) = 10 repos. {arm} and {prompt_id} are substituted.
-  repo_template: "<<<WYTRO: output HF repo id template, e.g. your-org/rewrite-{arm}-{prompt_id}>>>"
+  # DISABLED BY DEFAULT, AND THAT IS THE NORMAL CASE.
+  #
+  # Delivery of the finished data is arranged separately and is not this pipeline's job.
+  # The run ends with postprocessed parquet under out_root/shuffled/ -- see
+  # docs/GUIDE_FOR_TIANJIAN.md section 3.6 for the exact path, format and size.
+  # scripts/05_upload_to_hf.py is kept in the repo and works; it is disabled, not deleted.
+  #
+  # To turn it on you must set BOTH keys: enabled: true AND a real repo_template.
+  # Either one alone is a hard error from config.py, named at the earliest gate rather
+  # than surfacing as a crash inside create_repo().
+  #
+  # repo_template is deliberately EMPTY. It is not a plausible-looking default on purpose:
+  # a real-shaped repo id that nobody chose is worse than an absent one, because someone
+  # eventually runs step 6 against it. Whoever enables upload picks the real value.
+  enabled: false
+  repo_template: ""          # e.g. your-org/rewrite-{arm}-{prompt_id}
+                             # {arm} and {prompt_id} are substituted; 10 repos, one per job.
   private: true
   stage: shuffled            # raw | trimmed | shuffled
 

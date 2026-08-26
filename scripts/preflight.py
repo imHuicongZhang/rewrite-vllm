@@ -380,6 +380,15 @@ def c8_token(cfg, args) -> bool:
     except Exception as e:
         return fail(f"HF_TOKEN invalid: {e}")
 
+    # Upload is out of this pipeline's scope and ships disabled, so on the normal run
+    # there is nothing to check a write token against. Probing it anyway produced a
+    # warning about a token nobody needs -- noise in the one report that has to be read
+    # carefully.
+    if not cfg.data["upload"]["enabled"]:
+        ok("upload is disabled (configs/data.yaml upload.enabled: false) -- no write "
+           "token or output namespace needed")
+        return good
+
     try:
         who = HfApi(token=write_tok).whoami()
     except Exception as e:
@@ -449,8 +458,12 @@ def c9_disk(cfg, args) -> bool:
               f"{len(a.prompts)} -> {t/1e9:6.2f}B out   "
               f"(r={', '.join(f'{pr.r:.4f}' for pr in a.prompts)})")
     print(f"   -> raw {raw/2**40:.2f} TiB; on disk with compression="
-          f"{cfg.compression}: {comp/2**40:.2f} TiB"
+          f"{cfg.compression}: {comp/2**40:.2f} TiB per copy"
           + ("" if known else "   [row counts not known yet -- estimated]"))
+    print(f"   out_root holds TWO copies at rest -- raw/ (the trim is in place, so it is "
+          f"not consumed)")
+    print(f"   and shuffled/ -- so budget {2*comp/2**40:.2f} TiB there, not "
+          f"{comp/2**40:.2f} TiB.")
 
     good = True
     for key in ("out_root", "data_root", "tmp_root", "model_dir"):
@@ -459,7 +472,15 @@ def c9_disk(cfg, args) -> bool:
         free = shutil.disk_usage(p).free
         # data_root holds the downloaded remainders (662 GB of parquet across the five
         # arms, per the Hub) plus the re-sharded copy, not a fraction of the output.
-        need = {"out_root": comp,
+        #
+        # out_root is TWO full copies, not one. postprocess.in_place: true means the trim
+        # rewrites raw/ in place rather than consuming it, and the shuffle then writes
+        # shuffled/ as a second complete copy of the same rows. Both are still there when
+        # the run ends. Gating on one copy passed a disk that then filled part-way through
+        # a shuffle -- and the shuffle unlinks its bucket files as it consumes them, so
+        # running out of space there loses that job's entire shuffle, days into the run.
+        # That is the one stage where "free space and re-run" is not a clean recovery.
+        need = {"out_root": 2 * comp,
                 "data_root": 1.5 * 10**12,
                 "tmp_root": comp / max(1, n_arms) * 1.2,
                 "model_dir": 20 * 2**30}[key]

@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 # The whole run, end to end, resumable:
 #
-#   preflight -> model -> data -> 10 jobs SEQUENTIALLY -> postprocess -> upload
+#   preflight -> model -> data -> 10 jobs SEQUENTIALLY -> postprocess
+#
+# UPLOAD IS DISABLED BY DEFAULT (configs/data.yaml upload.enabled: false). Delivery of the
+# finished data is arranged separately; the run ends with parquet under out_root/shuffled/.
+# --skip-upload and upload.enabled are BOTH veto-only -- neither can switch upload ON when
+# the other says off -- so the two can never contradict each other.
 #
 # Safe to re-run after ANY interruption. Finished shards are skipped via their .done
 # sidecars; finished jobs are skipped without even loading a model.
 #
 #   bash scripts/run_all.sh                 # everything
 #   bash scripts/run_all.sh --status        # just print the job table and exit
-#   bash scripts/run_all.sh --skip-upload
+#   bash scripts/run_all.sh --skip-upload   # redundant while upload is disabled
 #   bash scripts/run_all.sh --from-job 5    # resume at job 5 (1-based, see the table)
+#   bash scripts/run_all.sh --postprocess-only [--arm A --prompt-id pN]
 #
 # JOBS RUN ONE AT A TIME, ON PURPOSE. Each job already uses every GPU. Running two would
 # make each vLLM engine try to reserve gpu_memory_utilization=0.85 of the same card and
@@ -22,9 +28,10 @@ cd "$REPO_ROOT"
 # --- ARGPARSE BEGIN (tests/test_integration.py extracts between these markers) ---
 STATUS_ONLY=0; SKIP_UPLOAD=0; SKIP_PREFLIGHT=0; FROM_JOB=1
 DO_PREPARE=1; DO_GENERATE=1; DO_POST=1; SKIP_CALIBRATION=0
+POST_ARM=""; POST_PROMPT=""; POST_ONLY=0
 
 usage() {
-  sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # A `while` loop over "$@", not `for a in "$@"`. The `for` form snapshots the positional
@@ -44,8 +51,21 @@ while [[ $# -gt 0 ]]; do
     # --- end. On every node in between: --generate-only. See GUIDE section 3.
     --prepare-only)     DO_GENERATE=0; DO_POST=0 ;;
     --generate-only)    DO_PREPARE=0; DO_POST=0 ;;
-    --postprocess-only) DO_PREPARE=0; DO_GENERATE=0; SKIP_PREFLIGHT=1 ;;
+    --postprocess-only) DO_PREPARE=0; DO_GENERATE=0; SKIP_PREFLIGHT=1; POST_ONLY=1 ;;
     --skip-calibration) SKIP_CALIBRATION=1 ;;
+    # --- postprocess job scoping. Different nodes may take DIFFERENT jobs; a per-job
+    # --- lock makes that safe and stops two nodes picking the same one. Without these
+    # --- flags every node sweeps the whole list and the locks sort out who takes what.
+    --arm)
+      shift
+      [[ $# -gt 0 ]] || { echo "*** STOP: --arm needs an arm name." >&2; exit 2; }
+      POST_ARM="$1" ;;
+    --arm=*)          POST_ARM="${1#*=}" ;;
+    --prompt-id)
+      shift
+      [[ $# -gt 0 ]] || { echo "*** STOP: --prompt-id needs a prompt id." >&2; exit 2; }
+      POST_PROMPT="$1" ;;
+    --prompt-id=*)    POST_PROMPT="${1#*=}" ;;
     --from-job)
       shift
       [[ $# -gt 0 ]] || { echo "*** STOP: --from-job needs a job number." >&2; exit 2; }
@@ -57,6 +77,7 @@ while [[ $# -gt 0 ]]; do
        echo "    valid: --status --skip-upload --skip-preflight --skip-calibration" >&2
        echo "           --from-job N|--from-job=N" >&2
        echo "           --prepare-only --generate-only --postprocess-only" >&2
+       echo "           --arm NAME --prompt-id pN   (scope --postprocess-only to one job)" >&2
        exit 2 ;;
   esac
   shift
@@ -64,6 +85,18 @@ done
 
 if ! [[ "$FROM_JOB" =~ ^[1-9][0-9]*$ ]]; then
   echo "*** STOP: --from-job must be a positive integer, got '$FROM_JOB'." >&2
+  exit 2
+fi
+if [[ -n "$POST_PROMPT" && -z "$POST_ARM" ]]; then
+  echo "*** STOP: --prompt-id needs --arm as well; a prompt id alone is ambiguous." >&2
+  exit 2
+fi
+# Only meaningful with --postprocess-only. On a full run they would silently mean
+# "generate all ten jobs, then postprocess one of them", which nobody wants and which
+# reads like a scoping flag for the whole run.
+if [[ -n "$POST_ARM" && "$POST_ONLY" != "1" ]]; then
+  echo "*** STOP: --arm/--prompt-id scope the POSTPROCESS stage, so they need" >&2
+  echo "    --postprocess-only. To run ONE generation job:  bash scripts/03_run_job.sh ARM pN" >&2
   exit 2
 fi
 # --- ARGPARSE END ---
@@ -113,6 +146,7 @@ print(f"NGPU={c.num_gpus}")
 print("GPU_IDS=" + shlex.quote(" ".join(str(g) for g in c.gpu_ids)))
 print("LOG_ROOT=" + shlex.quote(str(c.paths["log_root"])))
 print("OUT_ROOT=" + shlex.quote(str(c.paths["out_root"])))
+print("UPLOAD_ENABLED=" + ("1" if c.data["upload"]["enabled"] else "0"))
 PYCFG
 )"
 
@@ -201,20 +235,36 @@ done
 fi   # DO_GENERATE
 
 # ---- 4. postprocess: trim then shuffle, per job -------------------------------------
-# ONE node only. Two nodes shuffling the same job would share an output dir AND a bucket
-# temp dir, and bucketed_shuffle unlinks buckets as it consumes them -- that is real
-# corruption, not just wasted work. On a multi-node run use --postprocess-only, on one
-# node, after every node has finished generating.
+# NEVER TWO NODES ON THE SAME JOB -- they would share an output dir AND a bucket temp dir,
+# and bucketed_shuffle unlinks buckets as it consumes them, which is real corruption
+# rather than duplicated work. But DIFFERENT jobs do not collide: separate output dirs,
+# and tmp_root is node-local so bucket dirs cannot overlap either. So this fans out.
+#
+# 04_postprocess.py takes a per-job lock (the round-6 heartbeat machinery) and sweeps the
+# job list, skipping whatever another node holds. Run the same command on every node that
+# has finished generating and the work distributes itself. There are only 10 jobs, so
+# parallelism caps at 10 nodes.
 if [[ "$DO_POST" == "1" ]]; then
 echo; echo "### postprocess (trim -> shuffle, within (arm, prompt) only)"
-python -u scripts/04_postprocess.py --config-root "$REPO_ROOT"
+POST_ARGS=()
+[[ -n "$POST_ARM" ]]    && POST_ARGS+=(--arm "$POST_ARM")
+[[ -n "$POST_PROMPT" ]] && POST_ARGS+=(--prompt-id "$POST_PROMPT")
+python -u scripts/04_postprocess.py --config-root "$REPO_ROOT" ${POST_ARGS[@]+"${POST_ARGS[@]}"}
 
 # ---- 5. upload ---------------------------------------------------------------------
-if [[ "$SKIP_UPLOAD" == "0" ]]; then
+# Two independent vetoes, and that is the whole reconciliation: upload runs only if the
+# config allows it AND the flag did not suppress it. Neither can switch it ON alone, so
+# `--skip-upload` with upload.enabled: true means skip, and no flag at all with
+# upload.enabled: false also means skip. They cannot contradict each other.
+if [[ "$UPLOAD_ENABLED" == "0" ]]; then
+  echo; echo "### upload SKIPPED (disabled in configs/data.yaml: upload.enabled: false)"
+  echo "    The finished data is complete on disk at ${OUT_ROOT}/shuffled/ -- see"
+  echo "    docs/GUIDE_FOR_TIANJIAN.md section 3.6. Nothing further is required."
+elif [[ "$SKIP_UPLOAD" == "1" ]]; then
+  echo; echo "### upload SKIPPED (--skip-upload)"
+else
   echo; echo "### upload"
   python -u scripts/05_upload_to_hf.py --config-root "$REPO_ROOT"
-else
-  echo; echo "### upload SKIPPED (--skip-upload)"
 fi
 else
   echo; echo "### postprocess + upload: skipped (not this node's role)"

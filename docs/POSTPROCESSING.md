@@ -193,7 +193,7 @@ from `SIGNAL_WORDS`. Branch (a) needs a meta-opener *and* a signal word, so
 * `Rewritten Passage:` — stripped
 
 `qa`-style outputs opening with `Q:` never match either branch, which is what keeps the
-`wrap-inspired` p4 pass intact.
+`wrap-inspired` p1 pass intact.
 
 ---
 

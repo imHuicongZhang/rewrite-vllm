@@ -9,7 +9,7 @@ in full.
 
 Requires: PyYAML, pyarrow, numpy, zstandard, datasets. Exit 0 on success.
 """
-import json, os, random, shutil, sys, tempfile, types
+import json, os, random, shutil, sys, tempfile, time, types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -705,6 +705,215 @@ except SystemExit:
     ok2 = False
 expect(ok2, "3: require_doc_id: false accepts it and records doc_id_source=synthesized")
 fake_open_dataset.omit_doc_id = False
+
+# ================================================================= round 7
+hdr("4: upload is out of scope and ships disabled")
+
+_shipped_data = yaml.safe_load((REPO / "configs" / "data.yaml").read_text())
+_up = _shipped_data["upload"]
+expect(_up["enabled"] is False, "4.1: configs/data.yaml ships upload.enabled: false")
+expect(_up["repo_template"] == "",
+       f"4.1: repo_template is EMPTY, not a plausible-looking id (got {_up['repo_template']!r})")
+expect("<" * 3 not in str(_up.get("repo_template", "")),
+       "4.1: and it carries no leftover placeholder marker")
+
+# The whole point of §1: a clean checkout has no WYTRO blanks left, so the checker passes
+# for a run that will never upload.
+_raw_cfgs = (REPO / "configs" / "data.yaml").read_text() + (REPO / "configs" / "vllm.yaml").read_text()
+expect("<" * 3 + "WYTRO" not in _raw_cfgs,
+       "4.1: no WYTRO placeholder remains anywhere in the shipped configs")
+
+# enabled: true with a blank template must be a NAMED error, not a crash in create_repo("")
+def _load_with_upload(**over):
+    import copy, subprocess
+    root = Path(tempfile.mkdtemp(prefix="rwup-"))
+    shutil.copytree(CFG_ROOT / "configs", root / "configs")
+    shutil.copytree(CFG_ROOT / "prompts", root / "prompts")   # resolved against config root
+    dd = yaml.safe_load((root / "configs/data.yaml").read_text())
+    dd["upload"].update(over)
+    (root / "configs/data.yaml").write_text(yaml.safe_dump(dd, sort_keys=False))
+    code = ("import sys; sys.path.insert(0, %r);\n"
+            "from rewrite.config import load_config; load_config(%r)" % (str(REPO / "src"), str(root)))
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
+
+_rc, _out = _load_with_upload(enabled=True, repo_template="")
+expect(_rc != 0 and "repo_template" in _out and "enabled" in _out,
+       "4.2: upload.enabled: true with a blank repo_template is a clear config error")
+_rc, _out = _load_with_upload(enabled=True, repo_template="org/one-repo-for-everything")
+expect(_rc != 0 and "{arm}" in _out,
+       "4.2: a template without {arm}/{prompt_id} is rejected (10 jobs, one repo each)")
+_rc, _out = _load_with_upload(enabled=True, repo_template="org/rw-{arm}-{prompt_id}")
+if _rc != 0: print("       ", _out.strip()[:400])
+expect(_rc == 0, "4.2: enabled: true WITH a valid template loads fine")
+_rc, _out = _load_with_upload(enabled=False, repo_template="")
+expect(_rc == 0, "4.2: disabled with a blank template is the shipped, valid state")
+
+# 05_upload_to_hf.py must refuse cleanly rather than traceback, even under --dry-run
+import subprocess as _sp
+_r = _sp.run([sys.executable, str(REPO / "scripts" / "05_upload_to_hf.py"),
+              "--config-root", str(CFG_ROOT), "--dry-run"], capture_output=True, text=True)
+_txt = _r.stdout + _r.stderr
+expect(_r.returncode != 0 and "STOP" in _txt and "Traceback" not in _txt,
+       "4.3: 05_upload_to_hf.py stops cleanly when upload is disabled (no traceback)")
+expect("shuffled" in _txt,
+       "4.3: and it says where the finished data actually is")
+expect((REPO / "scripts" / "05_upload_to_hf.py").exists(),
+       "4.3: the upload script is still in the repo -- disabled, not deleted")
+
+hdr("5: per-job postprocess locking")
+
+_lk = WORK / "locktest" / ".postprocess.lock"
+_o1 = {"host": "nodeA", "pid": 111}
+_o2 = {"host": "nodeB", "pid": 222}
+expect(D.try_dir_lock(_lk, _o1, 1800, "j", log=lambda m: None) is True,
+       "5.1: try_dir_lock takes a free lock")
+expect(D.try_dir_lock(_lk, _o2, 1800, "j", log=lambda m: None) is False,
+       "5.1: a second node is refused IMMEDIATELY -- it does not wait")
+expect(D.read_lock_owner(_lk).get("host") == "nodeA",
+       "5.1: the lock still belongs to its original holder")
+os.utime(_lk, (time.time() - 4000, time.time() - 4000))
+expect(D.try_dir_lock(_lk, _o2, 1800, "j", log=lambda m: None) is True,
+       "5.1: a lock that stopped heartbeating IS taken over")
+expect(D.read_lock_owner(_lk).get("host") == "nodeB",
+       "5.1: and the taker-over records itself as the new owner")
+D.break_lock(_lk)
+expect(D.try_dir_lock(_lk, _o1, 1800, "j", log=lambda m: None) is True,
+       "5.1: break_lock releases it")
+D.break_lock(_lk)
+
+# The property that makes multi-node postprocess safe: jobs partition, none run twice.
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("pp7", REPO / "scripts" / "04_postprocess.py")
+_pp = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_pp)
+
+# A clean out_root: the real postprocess ran earlier in this file, so every job already
+# carries a _shuffle.done and the sweep would correctly skip all ten. Point it somewhere
+# empty so there is actually work to distribute.
+_cfg7 = C.load_config(CFG_ROOT)
+_cfg7.paths["out_root"] = WORK / "sweepout"
+_jobs7 = C.enumerate_jobs(_cfg7)
+_taken = {}
+_args7 = types.SimpleNamespace(stage="both", no_lock=False, workers=None)
+
+def _make_runner(node):
+    def _run(cfg, job, args):
+        _taken.setdefault(node, []).append(job.job_id)
+        m = cfg.shuffled_dir(job.arm, job.prompt.id)
+        m.mkdir(parents=True, exist_ok=True)
+        (m / "_shuffle.done").write_text("{}")
+        return {"shuffle": {"rows": 0}}
+    return _run
+
+# Two "nodes" interleaved: node B sweeps while node A holds one job's lock.
+_held = D.try_dir_lock(_pp.job_lock(_cfg7, _jobs7[0]), {"host": "nodeA", "pid": 1},
+                       1800, "held", log=lambda m: None)
+_pp.run_one = _make_runner("nodeB")
+_pp.HOSTNAME = "nodeB"
+_pp.sweep(_cfg7, _jobs7, _args7)
+expect(_held, "5.2: node A holds job 1's lock")
+expect(_jobs7[0].job_id not in _taken.get("nodeB", []),
+       f"5.2: node B did NOT touch the job node A holds ({_jobs7[0].job_id})")
+expect(len(_taken.get("nodeB", [])) == len(_jobs7) - 1,
+       f"5.2: node B took every OTHER job ({len(_taken.get('nodeB', []))}/{len(_jobs7)-1})")
+
+D.break_lock(_pp.job_lock(_cfg7, _jobs7[0]))
+_pp.run_one = _make_runner("nodeA")
+_pp.HOSTNAME = "nodeA"
+_pp.sweep(_cfg7, _jobs7, _args7)
+expect(_taken.get("nodeA", []) == [_jobs7[0].job_id],
+       "5.2: node A then takes exactly the one job that was left")
+_all7 = [j for v in _taken.values() for j in v]
+expect(sorted(_all7) == sorted(j.job_id for j in _jobs7),
+       "5.2: between them the two nodes covered all 10 jobs")
+expect(len(_all7) == len(set(_all7)),
+       "5.2: and no job was postprocessed twice")
+
+# The summary must survive concurrent writers, which the old whole-file rewrite did not.
+_sum = _cfg7.repo_root / "manifests" / "postprocess_summary.json"
+expect(_sum.exists(), "5.3: merged postprocess_summary.json was written")
+_merged = json.loads(_sum.read_text())
+expect(len(_merged) == len(_jobs7),
+       f"5.3: it holds ALL {len(_jobs7)} jobs, not just the last sweep's ({len(_merged)})")
+expect(not list((_cfg7.repo_root / "manifests").glob("*.tmp")),
+       "5.3: no temp files left behind")
+
+hdr("6: num_gpus is per node, and the docs say so")
+
+_gtxt = (REPO / "docs" / "GUIDE_FOR_TIANJIAN.md").read_text()
+_dtxt = (REPO / "configs" / "data.yaml").read_text()
+_ctxt = (REPO / "configs" / "cluster.yaml").read_text()
+expect("fleet_gpus" in _ctxt, "6.1: cluster.yaml offers compute.fleet_gpus")
+expect(yaml.safe_load(_ctxt)["compute"]["fleet_gpus"] is None,
+       "6.1: and it ships null, so single-node runs are unaffected")
+expect("PER NODE" in _dtxt or "per node" in _dtxt,
+       "6.2: data.yaml's ceiling box says the automatic check is per node")
+expect("fleet_gpus" in _dtxt,
+       "6.2: and points at the value that makes it a real check")
+expect("6,677 / 20" in _gtxt,
+       "6.2: the guide gives the arithmetic Tianjian can apply himself")
+
+# The regression this guards: a per-node count presented as the fleet's.
+_cal = (REPO / "scripts" / "06_calibrate.py").read_text()
+expect('"  fleet    :' not in _cal,
+       "6.3: 06_calibrate.py no longer labels one node's GPUs 'fleet'")
+expect("ON THIS NODE" in _cal and "PER NODE" in _cal,
+       "6.3: its projection is explicitly labelled per node")
+
+_pre = (REPO / "scripts" / "preflight.py").read_text()
+expect('"out_root": 2 * comp' in _pre,
+       "6.4: preflight gates out_root on TWO copies (raw/ survives the in-place trim)")
+
+# The check itself, not just the prose: fleet_gpus must actually bite where num_gpus cannot.
+# This corpus is tiny (quality-first has 1,234 rows), so it stands in for the real thing --
+# what is being tested is that the FLEET number is what gets compared.
+_fc = _copy.deepcopy(cfg)
+_fc.paths = dict(cfg.paths)
+_fc.data = _copy.deepcopy(cfg.data)
+_fc.cluster = _copy.deepcopy(cfg.cluster)
+_n_shards = D.load_manifest(cfg, "quality-first").n_shards
+_min_ratio = _fc.data["sharding"]["min_shards_per_gpu"]
+
+# num_gpus small enough to pass on its own; fleet large enough that the fleet must fail.
+_fc.cluster["compute"]["num_gpus"] = 1
+_fc.cluster["compute"]["fleet_gpus"] = None
+_fc.paths["data_root"] = WORK / "fleet_unset"
+try:
+    D.shard_arm(_fc, "quality-first", log=lambda m: None)
+    _unset_ok = True
+except SystemExit:
+    _unset_ok = False
+expect(_unset_ok, "6.5: with fleet_gpus unset, only this node's num_gpus is checked")
+
+_fc.cluster["compute"]["fleet_gpus"] = _n_shards * 2      # far over the ceiling
+_fc.paths["data_root"] = WORK / "fleet_over"
+import contextlib as _ctx, io as _io
+_err = _io.StringIO()
+try:
+    with _ctx.redirect_stderr(_err):        # stop() writes the message to stderr
+        D.shard_arm(_fc, "quality-first", log=lambda m: None)
+    _over_caught = False
+except SystemExit:
+    _over_caught = True
+_emsg = _err.getvalue()
+expect(_over_caught,
+       "6.5: a fleet that exceeds the ceiling IS caught once fleet_gpus is set")
+expect("across the fleet" in _emsg,
+       "6.5: and the error says the ratio is fleet-wide, not this node's")
+expect("shard_target_rows" in _emsg,
+       "6.5: and it computes the value to use instead of just refusing")
+
+_fc.cluster["compute"]["fleet_gpus"] = 1
+_fc.paths["data_root"] = WORK / "fleet_ok"
+_msgs = []
+try:
+    D.shard_arm(_fc, "quality-first", log=_msgs.append)
+    _ok_fleet = True
+except SystemExit:
+    _ok_fleet = False
+expect(_ok_fleet, "6.5: a fleet within the ceiling passes")
+expect(any("across the declared fleet" in m for m in _msgs),
+       "6.5: and the fleet-wide ratio is reported so it is auditable")
 
 # ================================================================= summary
 hdr("SUMMARY")

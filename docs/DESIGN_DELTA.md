@@ -489,12 +489,13 @@ the design. It is now computed from the config in one place and quoted from ther
 ### `shard_target_rows`: 2000 → 5000
 
 Round 3 chose 2000 because the smallest arm then had 5,602,476 documents, and at 100 GPUs
-10,000-row shards would have produced only 561 shards — failing the `min_shards_per_gpu: 20`
+*across the fleet* 10,000-row shards would have produced only 561 shards — failing the
+`min_shards_per_gpu: 20`
 guard. **The smallest remainder is now 33,381,230 documents, 6× larger, so that failure mode is
 gone** and every candidate passes with room. The live tradeoff is tail-idle against filesystem
 metadata load:
 
-| rows | input shards | output files (10 jobs) | smallest arm | ratio at 100 GPUs | tail |
+| rows | input shards | output files (10 jobs) | smallest arm | ratio at 100 GPUs *(fleet-wide)* | tail |
 |---:|---:|---:|---:|---:|---:|
 | 2,000 | 147,955 | 591,820 | 16,691 | 167:1 | ~2 min |
 | **5,000** | **59,184** | **236,736** | **6,677** | **67:1** | **~6 min** |
@@ -624,12 +625,23 @@ the header comment. A reader can see the GPU/no-GPU split without opening a Pyth
 | # | item | owner | blocks |
 |---|---|---|---|
 | B1 | `wytro/Know-Your-Sources-7B` is `gated: manual`. Tianjian's HF account must be granted access, or the repo ungated. | **Wytro** | everything — download is step 2 |
-| B2 | `upload.repo_template` — the output HF org/name pattern is still a `WYTRO` placeholder | **Wytro** | upload only (step 6) |
-| B3 | `HF_TOKEN_WRITE` — write-scoped token for the output org | **Wytro** | upload only |
+| ~~B2~~ | ~~`upload.repo_template` — the output HF org/name pattern is still a `WYTRO` placeholder~~ | — | **CLOSED (round 7)** — upload is out of scope. `upload.enabled: false` ships as the default and the placeholder is deleted rather than replaced with a plausible value. See the correction below. |
+| ~~B3~~ | ~~`HF_TOKEN_WRITE` — write-scoped token for the output org~~ | — | **CLOSED (round 7)** — not needed while upload is disabled |
 | B4 | 11 blanks in `configs/cluster.yaml` + `HF_TOKEN` in `.env` | **Tianjian** | everything |
 | B5 | Hub card has no `configs:` block. Not required — the access layer uses explicit globs — but it makes the dataset usable by anyone else. Draft ready at `data_reports/DATASET_CARD_DRAFT.md`. | Wytro | nothing |
 | ~~B6~~ | ~~`blab-jhu/KYS-Configs` access needed to diff the templates~~ | — | **CLOSED** — resolved without it, via git blob OIDs (§9) |
 | ~~B7~~ | ~~distill template may differ from the original~~ | — | **CLOSED** — all six templates verified byte-identical (§9) |
+
+
+**Correction to what B2 and B3 said (round 7).** Both were described as blocking "upload
+only (step 6)". That was wrong, and the error mattered: `load_config` runs
+`assert_no_placeholders` over `configs/data.yaml` on *every* entry point, so the unfilled
+`upload.repo_template` marker actually killed `01_download_model.py`,
+`02_download_data.py`, `04_postprocess.py`, `06_calibrate.py` and `run_rewrite.py` as well
+— and in `preflight.py` the `load_config` call sits outside the per-check `try`, so it
+aborted the whole preflight at check 2 with exit 2, no summary and no remaining checks.
+`--skip-upload` could not get past it either. A blank that was documented as affecting the
+last step in fact blocked the first. Deleting it removes the blocker outright.
 
 B1 remains the most likely day-zero failure, so **preflight checks it directly**: it fetches a
 real file rather than reading metadata, because listing a gated repo succeeds without access. No

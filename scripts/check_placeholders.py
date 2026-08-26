@@ -9,6 +9,11 @@ BOTH are hard errors. Wytro fills the WYTRO blanks before handoff, so by the tim
 repo reaches Tianjian only TIANJIAN blanks should remain; by the time he runs anything,
 none should.
 
+One conditional check beyond the scan: configs/data.yaml upload.repo_template is required
+ONLY when upload.enabled is true. Upload is out of this pipeline's scope and ships
+disabled, so the shipped template is empty and there is no marker to find -- what would
+have been an exemption is instead the positive rule that the two keys must agree.
+
 Exit code: 0 if the repo is clean, 1 if anything is left.
 
 Run standalone -- no third-party imports, so it works before any environment is built:
@@ -39,6 +44,57 @@ EXEMPT_DIRS = {"docs"}                  # the guide lists every blank verbatim
 
 TEXT_SUFFIXES = {".py", ".sh", ".yaml", ".yml", ".txt", ".md", ".json", ".sbatch",
                  ".cfg", ".toml", ".env", ".example", ""}
+
+
+# --------------------------------------------------------------- upload, conditionally
+# configs/data.yaml upload.repo_template used to be a hard-failing WYTRO blank. Upload is
+# now out of scope -- delivery is arranged separately -- so the shipped default is
+# `enabled: false` with an EMPTY template, and there is no marker left for the scan above
+# to find. What replaces the marker is this: the template is required only when upload is
+# actually switched on. Same rule, stated positively, and it also catches the reverse
+# mistake (enabled with nothing to upload to) at the earliest possible gate.
+#
+# No PyYAML: this script runs before the environment exists, which is the whole reason it
+# has no third-party imports. Two unique scalars inside one block, so the same targeted
+# regex approach run_all.sh:83-86 uses for cluster.yaml is sufficient here.
+
+
+def _upload_block(root: Path) -> dict:
+    """The scalars under `upload:` in configs/data.yaml. {} if the file is unreadable."""
+    try:
+        text = (root / "configs" / "data.yaml").read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    out, inside = {}, False
+    for line in text.splitlines():
+        if re.match(r"^upload:\s*(#.*)?$", line):
+            inside = True
+            continue
+        if inside:
+            if line.strip() and not line.startswith((" ", "\t")):
+                break                                   # dedented out of the block
+            m = re.match(r"^\s+([a-z_]+):\s*(.*?)\s*(?:#.*)?$", line)
+            if m:
+                out[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    return out
+
+
+def upload_problem(root: Path) -> str | None:
+    """The message to print, or None when nothing is wrong."""
+    up = _upload_block(root)
+    if up.get("enabled", "false").lower() != "true":
+        return None
+    tpl = up.get("repo_template", "")
+    if not tpl or _O in tpl:
+        return ("configs/data.yaml sets upload.enabled: true but upload.repo_template "
+                "is empty.\n"
+                "  Upload needs BOTH. Set a real template, e.g.\n"
+                "      repo_template: your-org/rewrite-{arm}-{prompt_id}\n"
+                "  or set  enabled: false  (the shipped default -- delivery of the "
+                "finished data\n"
+                "  is arranged separately, and the run's output is complete on disk "
+                "without it).")
+    return None
 
 
 def is_exempt(rel: Path) -> bool:
@@ -82,10 +138,17 @@ def main(argv=None) -> int:
     env = root / ".env"
     missing_env = not env.exists()
 
+    upload_bad = upload_problem(root)
+
     total = sum(len(v) for v in hits.values())
-    if total == 0 and not missing_env:
+    if total == 0 and not missing_env and not upload_bad:
         print("check_placeholders: OK -- no unresolved placeholders.")
         print(f"  exempt (templates/docs): {', '.join(sorted(EXEMPT_FILES))}, docs/")
+        if (_upload_block(root).get("enabled", "false").lower() != "true"):
+            print("  upload is disabled in configs/data.yaml, so upload.repo_template and "
+                  "HF_TOKEN_WRITE")
+            print("  are not required. The run ends with finished data on disk under "
+                  "out_root/shuffled/.")
         return 0
 
     for klass in ("TIANJIAN", "WYTRO"):
@@ -106,8 +169,18 @@ def main(argv=None) -> int:
         print("\n=== .env ===")
         print("  MISSING. Run:  cp .env.example .env   then fill in the blanks.")
 
-    print(f"\ncheck_placeholders: FAIL -- {total} placeholder(s) unresolved"
-          + (" and .env is missing." if missing_env else "."))
+    if upload_bad:
+        print("\n=== upload ===")
+        print("  " + upload_bad.replace("\n", "\n  "))
+
+    reasons = []
+    if total:
+        reasons.append(f"{total} placeholder(s) unresolved")
+    if missing_env:
+        reasons.append(".env is missing")
+    if upload_bad:
+        reasons.append("upload.enabled is true with no repo_template")
+    print(f"\ncheck_placeholders: FAIL -- " + "; ".join(reasons) + ".")
     print("  Both classes are hard errors. Nothing will run until they are all filled.")
     print("  Tianjian: see docs/GUIDE_FOR_TIANJIAN.md section 2.")
     return 1

@@ -414,6 +414,25 @@ def load_config(config_root: Path | str | None = None) -> Config:
         stop(f"cluster.yaml compute.gpu_ids has {len(list(g))} entries but "
              f"num_gpus is {n_gpus}")
 
+    # OPTIONAL, and null by default. num_gpus above is PER NODE; the ~330 shard ceiling
+    # is a constraint on the FLEET TOTAL, and no per-node value can see it. Setting this
+    # is the only way the ceiling gets checked by anything other than a human. See
+    # data.py's shard_arm() and configs/data.yaml sharding.
+    fg = cluster["compute"].get("fleet_gpus")
+    if fg is not None:
+        try:
+            fg = int(fg)
+        except (TypeError, ValueError):
+            stop(f"cluster.yaml compute.fleet_gpus must be an integer or null, got "
+                 f"{cluster['compute']['fleet_gpus']!r}")
+        if fg < 1:
+            stop(f"cluster.yaml compute.fleet_gpus must be >= 1 or null, got {fg}")
+        if fg < n_gpus:
+            stop(f"cluster.yaml compute.fleet_gpus is {fg} but this node alone declares "
+                 f"num_gpus: {n_gpus}. fleet_gpus is the TOTAL across every node, so it "
+                 f"can never be smaller than one node's share.")
+    cluster["compute"]["fleet_gpus"] = fg
+
     sa = cluster["compute"].get("shard_assignment", "dynamic")
     if sa not in ("dynamic", "static"):
         stop("cluster.yaml compute.shard_assignment must be 'dynamic' or 'static'")
@@ -430,6 +449,40 @@ def load_config(config_root: Path | str | None = None) -> Config:
         if not hf.get(k):
             stop(f"configs/data.yaml hf.{k} is required. The input is ONE HuggingFace "
                  "repo with one folder per arm, not six flat repos.")
+
+    # ---- upload: off by default, and the two keys must agree ----
+    # Round 7: delivery of the finished data is arranged separately, so the normal run
+    # never uploads. The failure this prevents is the one that used to happen: a blank or
+    # placeholder repo_template surfacing as an obscure crash inside create_repo(""), or
+    # -- worse -- an unfilled <<<WYTRO>>> marker taking down EVERY entry point through
+    # assert_no_placeholders, on a run that was never going to upload anything.
+    up = data.setdefault("upload", {})
+    en = up.get("enabled", False)
+    if not isinstance(en, bool):
+        stop(f"configs/data.yaml upload.enabled must be true or false, got {en!r}")
+    up["enabled"] = en
+    tpl = (up.get("repo_template") or "").strip()
+    up["repo_template"] = tpl
+    if en:
+        if not tpl:
+            stop("configs/data.yaml has upload.enabled: true but upload.repo_template is "
+                 "empty.\n"
+                 "  Upload needs BOTH. Either set a real template, e.g.\n"
+                 "      repo_template: your-org/rewrite-{arm}-{prompt_id}\n"
+                 "  or set  enabled: false  -- which is the shipped default, because "
+                 "delivery of\n"
+                 "  the finished data is arranged separately. The run's output is complete "
+                 "on disk\n"
+                 "  at out_root/shuffled/ either way; see GUIDE section 3.6.")
+        if "{arm}" not in tpl or "{prompt_id}" not in tpl:
+            stop(f"configs/data.yaml upload.repo_template is {tpl!r}, which has no "
+                 "{arm}/{prompt_id} placeholder.\n"
+                 "  There are 10 jobs and one repo per (arm, prompt), so without both "
+                 "substitutions\n"
+                 "  every job would be pushed to the same repo and overwrite the last.")
+    if up.get("stage", "shuffled") not in ("raw", "trimmed", "shuffled"):
+        stop("configs/data.yaml upload.stage must be raw|trimmed|shuffled, got "
+             f"{up.get('stage')!r}")
 
     # ---- arms and prompts ----
     defs = data["prompt_defs"]

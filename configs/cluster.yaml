@@ -14,6 +14,13 @@ paths:
   repo_root: "<<<TIANJIAN: absolute path to this cloned repo, e.g. /home/tj/rewrite-vllm>>>"
 
   # Qwen2.5-7B-Instruct weights + Llama-2 tokenizer. Needs ~20 GB free.
+  #
+  # NODE-LOCAL on a multi-node run -- put this on each node's own disk, not shared
+  # storage. Every vLLM process loads the full ~14.2 GiB of weights at every job start;
+  # on 25 nodes x 4 GPUs that is ~1.4 TiB read per job, ~14 TiB over the ten jobs, all of
+  # it competing with data_root reads and out_root writes on the same filesystem. A
+  # per-node copy costs one 14.2 GiB download per node, once. See GUIDE section 3.5.
+  # 01_download_model.py runs on every node and is safe to run concurrently either way.
   model_dir: "<<<TIANJIAN: dir for model downloads, needs ~20GB free>>>"
 
   # Downloaded and re-sharded input datasets. Needs roughly 2x the raw dataset size;
@@ -21,24 +28,45 @@ paths:
   data_root: "<<<TIANJIAN: dir for downloaded + resharded input data, needs several TB>>>"
 
   # Rewritten output. This is the big one: ~2.4 TB uncompressed, ~0.7 TB with zstd.
+  # SHARED across nodes, mounted at the same path everywhere.
+  # The ~0.7 TB is not one copy: the trim runs in place, so raw/ survives and shuffled/
+  # is a second full copy of the same rows. Both live here at the end of the run.
   out_root: "<<<TIANJIAN: dir for rewritten output, see the preflight disk estimate>>>"
 
   # Fast LOCAL scratch for shuffle bucket files (written then deleted). A network
-  # filesystem here will make the shuffle slow.
+  # filesystem here will make the shuffle slow. NODE-LOCAL -- and that is also what makes
+  # two nodes able to postprocess two DIFFERENT jobs at once without their bucket
+  # directories overlapping.
   # sizing: ~1.2x the largest single (arm, prompt) output.
   tmp_root: "<<<TIANJIAN: fast local scratch dir for shuffle temporaries>>>"
 
   # Per-worker logs. Small.
   log_root: "<<<TIANJIAN: dir for logs, e.g. ${repo_root}/logs>>>"
 
-  # HuggingFace cache (HF_HOME).
+  # HuggingFace cache (HF_HOME). NODE-LOCAL: it is a cache, and it should sit with
+  # model_dir rather than on shared storage.
   # Do NOT put this in a quota-limited home directory -- downloads will fill it.
-  hf_cache: "<<<TIANJIAN: HF_HOME cache dir, e.g. ${data_root}/hf_cache>>>"
+  hf_cache: "<<<TIANJIAN: HF_HOME cache dir, e.g. ${model_dir}/hf_cache>>>"
 
 compute:
-  # GPUs to use. One vLLM process per GPU, each tensor_parallel_size=1.
+  # GPUs on THIS NODE. One vLLM process per GPU, each tensor_parallel_size=1.
+  # PER NODE, not the fleet total -- every node runs with its own copy of this file's
+  # values, and this one sizes the worker pool on the machine it is read on.
   # how to find:  nvidia-smi --list-gpus | wc -l
   num_gpus: "<<<TIANJIAN: number of GPUs as a plain integer, e.g. 8>>>"
+
+  # OPTIONAL, and the only way the fleet-wide GPU ceiling gets checked by anything.
+  #
+  # The sharding caps this run at ~333 GPUs ACROSS THE WHOLE FLEET (see the box in
+  # configs/data.yaml sharding). num_gpus above is per node, so the automatic check in
+  # 02_download_data.py sees one node's share and cannot detect a fleet that exceeds the
+  # ceiling. Put the fleet total here and the check becomes real.
+  #
+  # Leave it null on a single-node run -- there num_gpus already IS the fleet.
+  # On a multi-node run, filling this in is strongly recommended: nothing else is
+  # checking, and the remedy is far cheaper before job 1 than after.
+  #   e.g. 25 nodes x 4 GPUs -> fleet_gpus: 100
+  fleet_gpus: null
 
   # "auto" = 0..num_gpus-1. Use an explicit list like [0,1,2,3] if other users share the
   # node and you must avoid some GPUs -- see GUIDE section 4.

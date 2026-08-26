@@ -418,6 +418,46 @@ def break_lock(lock: Path) -> None:
         pass
 
 
+def try_dir_lock(lock: Path, owner: dict, stale_after_s: float, label: str = "lock",
+                 log=print) -> bool:
+    """Take `lock` if it is free, or return False immediately. Never waits.
+
+    The non-blocking sibling of acquire_dir_lock, and the difference matters. Sharding an
+    arm is work that MUST happen, so a loser there should wait for the winner. Postprocess
+    is a list of ten independent jobs, so a loser should go and do a different one -- a
+    node that blocked for up to 24h on a job another node is already shuffling would sit
+    idle while eight other jobs went untouched.
+
+    Stale locks are taken over on the same terms as everywhere else: mtime older than
+    stale_after_s means the holder stopped heartbeating and is presumed dead.
+    """
+    lock = Path(lock)
+    for _ in range(2):                        # at most one takeover, then one retry
+        try:
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            lock.mkdir()
+        except FileExistsError:
+            pass
+        except OSError:
+            return False
+        else:
+            try:
+                atomic_write_text(json.dumps(owner, indent=2), lock / "owner.json")
+            except OSError:
+                pass
+            return True
+
+        age = lock_age_s(lock)
+        if age <= stale_after_s:
+            return False
+        who = read_lock_owner(lock)
+        log(f"[lock] {label}: held by {who.get('host', '?')}/pid {who.get('pid', '?')} "
+            f"but not heartbeated for {age / 60:.0f} min (stale after "
+            f"{stale_after_s / 60:.0f} min) -- taking it over")
+        break_lock(lock)
+    return False
+
+
 def acquire_dir_lock(lock: Path, done_when, owner: dict, stale_after_s: float,
                      max_wait_s: float = SHARD_LOCK_MAX_WAIT_S, label: str = "lock",
                      log=print) -> bool:
@@ -765,30 +805,56 @@ def shard_arm(cfg: Config, arm_name: str, log=print, count_tokens: bool = False)
                  f"  Every token, disk and wall-clock estimate in this run derives from "
                  f"`docs` and `source_tokens_llama2`, so this is not a warning.")
 
-        if True:
-            min_ratio = int(sh["min_shards_per_gpu"])
-            need = min_ratio * cfg.num_gpus
-            if man.n_shards < need:
-                # Do the arithmetic here rather than leaving it to be discovered: the useful
-                # output is the number to use, not the fact that the current one is wrong.
-                # At the shipped 5,000 rows/shard the smallest arm gives 6,677 shards, 67:1 at
-                # 100 GPUs, so this should not fire -- if it does, either num_gpus is far
-                # larger than planned or an arm is much smaller than data.yaml declares.
-                suggested = max(200, (total_rows // need) // 100 * 100)
-                stop(
-                    f"{a.name}: only {man.n_shards} shards for {cfg.num_gpus} GPUs "
-                    f"({man.n_shards / cfg.num_gpus:.1f}:1), below the required "
-                    f"{min_ratio}:1.\n"
-                    f"  A shard is the unit of work, so when shards barely outnumber workers "
-                    f"the tail of every job leaves most GPUs idle.\n"
-                    f"  This arm has {total_rows:,} rows and you have {cfg.num_gpus} GPUs, so "
-                    f"it needs >= {need:,} shards.\n"
-                    f"  SET configs/data.yaml sharding.shard_target_rows: {suggested}   "
-                    f"(currently {target_rows})\n"
-                    f"  Then delete {out_dir} and re-run 02_download_data.py.\n"
-                    f"  DECIDE THIS BEFORE JOB 1: shard size feeds the manifest fingerprint, so "
-                    f"changing it after generation starts invalidates every .done marker."
-                )
+        # ------------------------------------------------------------------ GPU ceiling
+        # READ THIS BEFORE TRUSTING IT. There are two checks here and they cover
+        # different things:
+        #
+        #   num_gpus   is PER NODE. The check below therefore only ever sees one node's
+        #              share. On a 25-node fleet it compares 6,677 shards against 4 GPUs
+        #              -- 1,669:1 -- and passes trivially. It is NOT a fleet-wide guard
+        #              and must not be described as one.
+        #   fleet_gpus is the fleet total, OPTIONAL, and null by default. It is the only
+        #              thing in this repo that can actually enforce the ~333 ceiling.
+        #              When it is null, nobody but a human is checking.
+        min_ratio = int(sh["min_shards_per_gpu"])
+
+        def _ceiling_stop(n_gpus: int, scope: str) -> None:
+            # Do the arithmetic here rather than leaving it to be discovered: the useful
+            # output is the number to use, not the fact that the current one is wrong.
+            need = min_ratio * n_gpus
+            suggested = max(200, (total_rows // need) // 100 * 100)
+            stop(
+                f"{a.name}: only {man.n_shards} shards for {n_gpus} GPUs {scope} "
+                f"({man.n_shards / n_gpus:.1f}:1), below the required {min_ratio}:1.\n"
+                f"  A shard is the unit of work, so when shards barely outnumber workers "
+                f"the tail of every job leaves most GPUs idle.\n"
+                f"  This arm has {total_rows:,} rows and there are {n_gpus} GPUs {scope}, "
+                f"so it needs >= {need:,} shards.\n"
+                f"  SET configs/data.yaml sharding.shard_target_rows: {suggested}   "
+                f"(currently {target_rows})\n"
+                f"  Then delete {out_dir} and re-run 02_download_data.py.\n"
+                f"  DECIDE THIS BEFORE JOB 1: shard size feeds the manifest fingerprint, so "
+                f"changing it after generation starts invalidates every .done marker."
+            )
+
+        if man.n_shards < min_ratio * cfg.num_gpus:
+            _ceiling_stop(cfg.num_gpus, "on this node")
+
+        fleet = cfg.cluster["compute"].get("fleet_gpus")
+        if fleet:
+            fleet = int(fleet)
+            if man.n_shards < min_ratio * fleet:
+                _ceiling_stop(fleet, "across the fleet")
+            log(f"[data] {a.name}: {man.n_shards / fleet:.1f}:1 shards per GPU across the "
+                f"declared fleet of {fleet} ({min_ratio}:1 required)")
+        elif cfg.num_gpus < man.n_shards // max(1, min_ratio * 4):
+            # Only worth saying when this node is plainly a fraction of something larger.
+            log(f"[data] {a.name}: NOTE -- shard ratio was checked against this node's "
+                f"{cfg.num_gpus} GPU(s) only. The ~333 GPU ceiling is a FLEET-WIDE limit "
+                f"and compute.fleet_gpus is unset, so it was NOT checked. On a multi-node "
+                f"run set compute.fleet_gpus in cluster.yaml, or do the arithmetic "
+                f"yourself: {man.n_shards} shards / {min_ratio} = "
+                f"{man.n_shards // min_ratio} GPUs max for this arm.")
 
     atomic_write_text(man.to_json(), manifest_path(cfg, a.name))
     break_lock(lock)

@@ -153,13 +153,19 @@ def main(argv=None) -> int:
 
     # ---- projection from the ACTUAL manifest row counts ----
     tps, tpd = r["tok_s_per_gpu"], r["tok_per_doc"]
+    # PER NODE. cfg.num_gpus is this node's GPU count, not the fleet's, so every wall-clock
+    # figure below is what ONE node would take on its own. On a 25-node fleet the real
+    # elapsed time is roughly this divided by 25. Calibration measures one node because
+    # that is all it can see; the projection is labelled accordingly rather than quietly
+    # presenting a single node's number as the run's ETA.
     ngpu = cfg.num_gpus
     print()
     print(f"  measured : {tps:,.0f} output tok/s per GPU")
     print(f"             {tpd:,.0f} output tokens per document")
     if r["cards"]:
         print(f"  on       : {', '.join(r['cards'])}")
-    print(f"  fleet    : {ngpu} GPU(s) -> {tps * ngpu / 1e6:,.1f} M tok/s aggregate")
+    print(f"  this node: {ngpu} GPU(s) -> {tps * ngpu / 1e6:,.1f} M tok/s aggregate "
+          f"(PER NODE -- multiply by your node count for the fleet)")
 
     # ---- PREFILL vs DECODE --------------------------------------------------------
     # This workload is prefill-heavy in a way most rewriting workloads are not: the
@@ -230,7 +236,8 @@ def main(argv=None) -> int:
         return 0
 
     print()
-    print(f"  {'JOB':30s} {'ROWS':>14s} {'OUT TOKENS':>13s} {'TOK/DOC':>9s} {'WALL':>10s}")
+    print(f"  {'JOB':30s} {'ROWS':>14s} {'OUT TOKENS':>13s} {'TOK/DOC':>9s} "
+          f"{'WALL/NODE':>10s}")
     for jid, rows, tok, hrs, tpd_job, measured in per_job:
         print(f"  {jid:30s} {rows:14,d} {tok / 1e9:12.2f}B {tpd_job:9,.0f} "
               f"{human_time(hrs):>10s}" + ("" if measured else "   [rate-derived]"))
@@ -240,9 +247,20 @@ def main(argv=None) -> int:
     print("=" * 74)
     print(f"  PROJECTED TOTAL: {total_tok / 1e9:,.0f}B output tokens over "
           f"{total_rows:,} rows")
-    print(f"  AT {tps:,.0f} tok/s/GPU x {ngpu} GPUs  ->  {human_time(total_h)}")
+    print(f"  AT {tps:,.0f} tok/s/GPU x {ngpu} GPUs ON THIS NODE  ->  "
+          f"{human_time(total_h)}")
     print("=" * 74)
-    print(f"  Sensitivity, since the measured rate is the whole projection:")
+    print("  THAT IS A SINGLE NODE'S PROJECTION. num_gpus is per node, so if you are")
+    print("  generating on N nodes the fleet finishes in roughly that divided by N:")
+    for n_nodes in (1, 5, 10, 25):
+        print(f"    {n_nodes:>3d} node(s) ({n_nodes * ngpu:>4d} GPUs total)  ->  "
+              f"{human_time(total_h / n_nodes)}"
+              + ("   <-- this node alone" if n_nodes == 1 else ""))
+    print("  (Generation fans out across nodes; postprocess fans out too, but only as far")
+    print("   as 10 jobs. See GUIDE section 3.5.)")
+    print("=" * 74)
+    print(f"  Sensitivity, since the measured rate is the whole projection "
+          f"(per node, as above):")
     for mult, label in ((0.5, "half"), (1.0, "measured"), (2.0, "double")):
         print(f"    {tps * mult:>9,.0f} tok/s/GPU  ->  {human_time(total_h / mult)}"
               + ("   <-- measured" if mult == 1.0 else ""))

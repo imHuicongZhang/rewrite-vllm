@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Push each finished (arm, prompt) output to its own HuggingFace dataset repo.
 
+DISABLED BY DEFAULT, AND THAT IS DELIBERATE. configs/data.yaml ships upload.enabled:
+false because delivery of the finished data is arranged separately and is not this
+pipeline's job. The run ends with postprocessed parquet on disk under out_root/shuffled/
+-- see docs/GUIDE_FOR_TIANJIAN.md section 3.6. This script is kept, and works; it is
+disabled, not deleted. To use it, set BOTH upload.enabled: true AND upload.repo_template.
+
 Repo names come from configs/data.yaml upload.repo_template, e.g.
     your-org/rewrite-{arm}-{prompt_id}
 
@@ -54,6 +60,12 @@ def with_retry(fn, what: str, log=print):
 
 def repo_name(cfg, job) -> str:
     tpl = cfg.data["upload"]["repo_template"]
+    # load_config already refuses a blank or placeholder-shaped template when upload is
+    # enabled, so reaching here with one means this function was called from somewhere
+    # that bypassed the config gate. Say so rather than pushing to a repo named "".
+    if not tpl:
+        stop("upload.repo_template is empty -- refusing to derive a repo name from it. "
+             "Set it in configs/data.yaml alongside upload.enabled: true.")
     return tpl.format(arm=job.arm, prompt_id=job.prompt.id)
 
 
@@ -211,6 +223,21 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config_root)
+
+    # The gate. Refuse clearly and early, including under --dry-run: a dry run that
+    # cheerfully reports what it WOULD push is the wrong answer when nothing should be
+    # pushed at all.
+    if not cfg.data["upload"]["enabled"]:
+        stop("upload is DISABLED in configs/data.yaml (upload.enabled: false).\n"
+             "  That is the shipped default: delivery of the finished data is arranged\n"
+             "  separately, and this pipeline's job ends at postprocess. The finished\n"
+             "  data is already complete on disk at:\n"
+             f"      {cfg.paths['out_root']}/shuffled/<arm>/<prompt_id>/part_NNNNN.parquet\n"
+             "  If you really do want to upload, set BOTH in configs/data.yaml:\n"
+             "      upload.enabled: true\n"
+             "      upload.repo_template: your-org/rewrite-{arm}-{prompt_id}\n"
+             "  and put a write-scoped token in HF_TOKEN_WRITE. See GUIDE section 3.6.")
+
     token = cfg.env.get("HF_TOKEN_WRITE") or cfg.env.get("HF_TOKEN")
     if not token and not args.dry_run:
         stop("no HF_TOKEN_WRITE (or HF_TOKEN) in .env -- upload needs write scope")
