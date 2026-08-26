@@ -27,9 +27,9 @@ paths:
   # preflight.py prints the real number for your repo IDs.
   data_root: "<<<TIANJIAN: dir for downloaded + resharded input data, needs several TB>>>"
 
-  # Rewritten output. This is the big one: ~2.4 TB uncompressed, ~0.7 TB with zstd.
+  # Rewritten output. This is the big one: ~2.6 TB uncompressed, ~0.77 TB with zstd.
   # SHARED across nodes, mounted at the same path everywhere.
-  # The ~0.7 TB is not one copy: the trim runs in place, so raw/ survives and shuffled/
+  # The ~0.77 TB is not one copy: the trim runs in place, so raw/ survives and shuffled/
   # is a second full copy of the same rows. Both live here at the end of the run.
   out_root: "<<<TIANJIAN: dir for rewritten output, see the preflight disk estimate>>>"
 

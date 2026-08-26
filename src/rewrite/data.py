@@ -141,10 +141,22 @@ def compute_fingerprint(cfg: Config, content_sha1: str, doc_id_source: str) -> s
     fingerprint, so a resume across that flip would have silently matched .done markers
     written against different doc_ids. The rule is that the fingerprint covers everything
     that would renumber rows.
+
+    `output.keys` is folded in as of round 8, and the rule above is why. Adding record_id
+    does not renumber anything -- doc_id and the text are untouched -- so on the narrow
+    reading it does not belong here. It belongs here on the broader one: a .done marker
+    asserts that shard N's OUTPUT is complete and correct, and after a schema change the
+    rows behind an old marker are no longer either. Without this, adding a key mid-run
+    would leave the already-generated shards matching their markers, silently skipped, and
+    the job would "complete" with some rows carrying record_id and some not -- which
+    surfaces only as nulls in the shuffled parquet, long after the GPU time is spent.
+    Folding the key list in makes any output-schema change invalidate the markers instead,
+    which is the loud failure. It costs nothing today: this lands before job 1.
     """
     sh = cfg.data["sharding"]
     blob = "|".join([content_sha1, str(sh["shard_target_rows"]),
-                     str(sh["shard_target_bytes"]), DOC_ID_POLICY, doc_id_source])
+                     str(sh["shard_target_bytes"]), DOC_ID_POLICY, doc_id_source,
+                     ",".join(cfg.data["output"]["keys"])])
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
 
@@ -714,7 +726,7 @@ def shard_arm(cfg: Config, arm_name: str, log=print, count_tokens: bool = False)
             msg = (f"{a.name}: {cfg.hf_repo_id}/{a.subdir} has NO 'doc_id' column "
                    f"(columns: {ds.column_names}).\n"
                    f"  doc_id is the key that joins rewritten output back to the input corpus "
-                   f"-- topic labels, quality scores, anything not carried in the 11-key output "
+                   f"-- topic labels, quality scores, anything not carried in the 12-key output "
                    f"schema.\n"
                    f"  Without it this pipeline synthesizes a row index, which is deterministic "
                    f"but only meaningful relative to this sharding: data_root/shards/ then has "
@@ -729,6 +741,28 @@ def shard_arm(cfg: Config, arm_name: str, log=print, count_tokens: bool = False)
             for line in msg.splitlines():
                 log("[data] " + line)
             log("[data] " + "-"*65)
+        # record_id is part of the declared output schema (configs/data.yaml output.keys)
+        # as of round 8, so the input has to supply it. It is a real column of the pinned
+        # revision -- verified against the Hub and against the upload code, which cross-
+        # checks it on every uploaded row -- so its absence means this is not the dataset
+        # the run was specified against, not that a fallback is wanted.
+        want_record_id = "record_id" in list(cfg.data["output"]["keys"])
+        has_record_id = "record_id" in ds.column_names
+        if want_record_id and not has_record_id:
+            break_lock(lock)
+            stop(f"{a.name}: {cfg.hf_repo_id}/{a.subdir} has NO 'record_id' column "
+                 f"(columns: {ds.column_names}).\n"
+                 f"  configs/data.yaml output.keys lists record_id, so every output row "
+                 f"must carry it.\n"
+                 f"  record_id is the WARC-Record-ID and IS present in the pinned revision "
+                 f"({cfg.hf_revision[:12]}); if it is missing here, the revision or the "
+                 f"subdir is not what this run was specified against.\n"
+                 f"  Do NOT try to parse it out of the `metadata` blob -- the column holds "
+                 f"exactly the same value.\n"
+                 f"  If you genuinely mean to run without it, remove record_id from "
+                 f"configs/data.yaml output.keys. That changes the manifest fingerprint, so "
+                 f"do it before job 1.")
+
         ltok = None
         if count_tokens:
             from .engine import load_llama2_tokenizer
@@ -738,31 +772,35 @@ def shard_arm(cfg: Config, arm_name: str, log=print, count_tokens: bool = False)
         total_rows = total_bytes = total_tok = 0
         shards = []
         shard_idx = 0
-        buf_ids, buf_txt, buf_sha = [], [], []
+        buf_ids, buf_txt, buf_sha, buf_rid = [], [], [], []
         buf_bytes = 0
 
         def flush():
-            nonlocal shard_idx, buf_ids, buf_txt, buf_sha, buf_bytes
+            nonlocal shard_idx, buf_ids, buf_txt, buf_sha, buf_rid, buf_bytes
             if not buf_txt:
                 return
-            tbl = pa.table({
+            cols = {
                 "doc_id": pa.array(buf_ids, type=pa.int64()),
                 col: pa.array(buf_txt, type=pa.large_string()),
                 "source_text_sha1": pa.array(buf_sha, type=pa.string()),
-            })
-            atomic_write_table(tbl, out_dir / f"part_{shard_idx:05d}.parquet")
+            }
+            if want_record_id:
+                cols["record_id"] = pa.array(buf_rid, type=pa.large_string())
+            atomic_write_table(pa.table(cols), out_dir / f"part_{shard_idx:05d}.parquet")
             shards.append({"index": shard_idx, "path": f"part_{shard_idx:05d}.parquet",
                            "n_rows": len(buf_txt), "text_bytes": buf_bytes})
             shard_idx += 1
-            buf_ids, buf_txt, buf_sha, buf_bytes = [], [], [], 0
+            buf_ids, buf_txt, buf_sha, buf_rid, buf_bytes = [], [], [], [], 0
 
         log(f"[data] {a.name}: sharding "
             f"(target {target_rows:,} rows / {target_bytes/2**20:.0f} MiB per shard)")
 
         for batch in ds.select_columns(
-                [c for c in (col, "doc_id") if c in ds.column_names]).iter(batch_size=1000):
+                [c for c in (col, "doc_id", "record_id")
+                 if c in ds.column_names]).iter(batch_size=1000):
             texts = batch[col]
             ids = batch["doc_id"] if has_doc_id else None
+            rids = batch["record_id"] if (want_record_id and has_record_id) else None
             if count_tokens:
                 total_tok += sum(len(x) for x in ltok(
                     [t or "" for t in texts], add_special_tokens=False).input_ids)
@@ -774,6 +812,8 @@ def shard_arm(cfg: Config, arm_name: str, log=print, count_tokens: bool = False)
                 buf_ids.append(int(ids[k]) if ids is not None else total_rows)
                 buf_txt.append(t)
                 buf_sha.append(h)
+                if want_record_id:
+                    buf_rid.append(rids[k] or "" if rids is not None else "")
                 buf_bytes += nb
                 total_rows += 1
                 total_bytes += nb
@@ -1050,7 +1090,11 @@ def jsonl_to_table(path: Path, keys: list):
         for k in keys:
             cols[k].append(row.get(k))
     types = {
-        "doc_id": pa.int64(), "arm": pa.large_string(), "prompt_id": pa.large_string(),
+        "doc_id": pa.int64(),
+        # The WARC-Record-ID of the source document, verbatim from the uploaded dataset.
+        # NOT a unique key -- see configs/data.yaml output.keys.
+        "record_id": pa.large_string(),
+        "arm": pa.large_string(), "prompt_id": pa.large_string(),
         "source_text_sha1": pa.string(), "rewritten_text": pa.large_string(),
         "finish_reason": pa.large_string(), "n_prompt_tokens": pa.int32(),
         "n_output_tokens": pa.int32(), "status": pa.int8(),

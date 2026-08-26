@@ -252,7 +252,7 @@ sharding:
 
 output:
   format: jsonl
-  # The 11 keys written per row. status and n_output_tokens_llama2 are beyond the 8-key
+  # The 12 keys written per row. status and n_output_tokens_llama2 are beyond the 8-key
   # spec because the ported trim logic filters on status==2 and the token budget is
   # counted in Llama-2 tokens, exactly as the source did.
   #
@@ -261,16 +261,57 @@ output:
   # (07_rewrite/rewrite_worker.py:316-323); here it is present in every row of every job so
   # the ten output sets share one schema. Without it the style assignment is unrecoverable
   # after the fact.
-  keys: [doc_id, arm, prompt_id, source_text_sha1, rewritten_text, finish_reason,
-         n_prompt_tokens, n_output_tokens, status, n_output_tokens_llama2, wrap_style]
+  #
+  # ---------------------------------------------------------------------------------
+  # record_id -- ADDED ROUND 8, and it is NOT A UNIQUE KEY. Read this before using it.
+  #
+  # It is the WARC-Record-ID of the source document, e.g.
+  #     <urn:uuid:4038e004-b67f-474c-868d-2c3670cd6a32>
+  # copied verbatim from the `record_id` column of the uploaded dataset. It is NOT parsed
+  # out of the `metadata` JSON blob -- the column already carries exactly that value.
+  #
+  # WHAT IT IS FOR. doc_id is a surrogate: the global row index into the 600M master
+  # corpus (13_600M/materialize_master.py:114, np.arange). It is durable only as long as
+  # that artifact is. If the master were ever regenerated with different inputs or
+  # ordering, every doc_id would shift and every downstream join would mis-resolve
+  # SILENTLY. record_id is carried so that failure is REPAIRABLE: the doc_id -> document
+  # mapping can be re-derived by joining record_id against a rebuilt master, with
+  # payload_digest (also on the Hub) breaking the rare ties.
+  #
+  # WHAT IT IS NOT. It does not uniquely identify a row. Measured exactly over all
+  # 600,000,000 master rows: 599,603,031 distinct, i.e. 396,969 rows (0.0662%) share a
+  # record_id with another row. Those are the SAME WARC record drawn twice into the DCLM
+  # sample -- identical url, payload_digest, crawl and text_len, differing only in
+  # shard/line_no/doc_id -- so they are duplicate documents, not id collisions between
+  # different documents. A join on record_id alone therefore FANS OUT 2:1 on ~397k
+  # documents and silently inflates row counts instead of erroring.
+  #
+  #   => doc_id remains THE key. It is unique by construction. record_id is a repair
+  #      path, not a replacement, and must never be used as a join key on its own.
+  #
+  # Rejected for this role: `crawl` (CC-MAIN-2018-09) is a crawl SNAPSHOT label shared by
+  # billions of documents -- 89 distinct values across a 497,055-row shard. So is
+  # WARC-Warcinfo-ID inside metadata, which identifies a WARC FILE: every record in one
+  # file shares it. Neither is a document identifier.
+  # ---------------------------------------------------------------------------------
+  keys: [doc_id, record_id, arm, prompt_id, source_text_sha1, rewritten_text,
+         finish_reason, n_prompt_tokens, n_output_tokens, status,
+         n_output_tokens_llama2, wrap_style]
   # Sizing model used by scripts/preflight.py for its free-disk check. Stated here so the
   # estimate is auditable rather than magic:
   #   bytes ~= bytes_per_output_token * output_tokens + bytes_per_row_overhead * rows
   # 4.2 B/token = ~3.8 chars/token of UTF-8 English + ~10% JSON string escaping.
-  # 235 B/row  = the JSON envelope (keys, doc_id, 40-char sha1, counts, punctuation),
-  #              raised from 220 for the wrap_style key.
+  # 297 B/row  = the JSON envelope (keys, doc_id, 40-char sha1, counts, punctuation),
+  #              raised from 220 for the wrap_style key, then from 235 to 297 in round 8
+  #              for record_id. That +62 is measured, not assumed: 497,055 real record_id
+  #              values serialised as a JSON field average exactly 62.0 B/row uncompressed
+  #              ("record_id":"<urn:uuid:...>", = 12 + 49 + 1). Compressed it is far less
+  #              -- 21.1 B/row as JSONL+zstd, 19.4 B/row as parquet+zstd -- because the key
+  #              name and the <urn:uuid: wrapper are constants; only the 32 hex digits
+  #              carry entropy, and they are ~16 B of it. Net effect on the deliverable is
+  #              about +3.1%.
   bytes_per_output_token: 4.2
-  bytes_per_row_overhead: 235
+  bytes_per_row_overhead: 297
   # There is no est_output_tokens_per_arm scalar any more. The real per-arm figures span
   # 35.9B to 99.5B -- a 2.8x spread -- so a single number cannot express them. Each arm
   # carries its own est_output_tokens, measured; preflight sums them.

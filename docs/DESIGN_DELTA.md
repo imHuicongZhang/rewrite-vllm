@@ -940,3 +940,98 @@ not. A token count is a smoke test; the byte comparison is the proof.
 6. **`quality-base` has no home in this pipeline.** It is 50B raw tokens, 37.3M documents, and
    exists only at `01_before_rw/quality-base/`. Whoever assembles the final training mixes needs
    it; nothing in `rewrite-vllm` will produce or move it.
+
+7. **A natural document identifier — round 8 verified, round 9 IMPLEMENTED. CLOSED.**
+   Wytro confirmed `record_id` on the Hub via the Data Studio view and approved the
+   additive change. `record_id` is now the 12th key of `output.keys`; `doc_id` is
+   untouched. Two identifiers were explicitly rejected in the same decision: `crawl`
+   (a crawl SNAPSHOT label) and `WARC-Warcinfo-ID` inside `metadata` (which identifies a
+   WARC *file* — every record in one file shares it, the same class of error as `crawl`,
+   and unnecessary regardless since the `record_id` column already holds exactly the
+   WARC-Record-ID value, so nothing is parsed out of `metadata`). The findings that led
+   there are kept below, because the measured numbers are the reason the change is
+   additive rather than a replacement.
+
+   **Original framing:** `doc_id` is a surrogate: `materialize_master.py:114`
+   assigns it as `np.arange(lo, lo + n, dtype=np.int64)`, a global row index over the master
+   corpus concatenated in shard order. It is durable only as long as that artifact is; if the
+   master were ever regenerated with different inputs or ordering, every `doc_id` shifts and
+   every downstream join mis-resolves **silently**.
+
+   Measured on the real master corpus (all 1,103 shards, 600,000,000 rows, exact — not
+   sampled):
+
+   | column | example | distinct / 600,000,000 | verdict |
+   |---|---|---:|---|
+   | `record_id` | `<urn:uuid:63e688d6-238c-43a2-89d2-dcbc9e4f71dc>` | **599,603,031 (99.9338%)** | the WARC-Record-ID; the only real candidate |
+   | `payload_digest` | `sha1:RWBEZ7DBLT5ERTA6VNOJ3PWCT7NGPXGI` | ~99.998% per shard | content hash — collides on duplicate text by design |
+   | `url` | `http://cdm.link/tag/euclid/` | ~99.99% per shard | not an identifier; same page recrawled |
+   | `crawl` | `CC-MAIN-2018-09` | **89 per ~500k-row shard (0.018%)** | **a crawl SNAPSHOT label, not a document id** |
+
+   **`crawl` is the `CC-MAIN-2026-...` form that was recalled, and it is not a document
+   identifier.** It labels a Common Crawl snapshot shared by billions of documents; 89 distinct
+   values cover a 497,055-row shard. Switching the join key to it would be a severe regression.
+
+   **`record_id` is near-unique but not a primary key.** 396,969 rows (0.0662%) share a
+   `record_id` with another row. Inspected in shard 440: the duplicate pairs are the *same WARC
+   record* drawn twice from different DCLM source shards — identical `url`, `payload_digest`,
+   `crawl` and `text_len`, differing only in `shard`/`line_no`/`doc_id`. Maximum multiplicity 2.
+   These are genuine duplicate documents in the upstream sample, not id collisions between
+   different documents. **So `record_id` cannot replace `doc_id`**, which is a true primary key
+   by construction — the proposal has to be additive, and that is a property of the data rather
+   than a matter of preference.
+
+   **It is already in the uploaded dataset; carrying it needs no re-upload.** Neither
+   `materialize_blocks.py` nor `upload_blocks.py` projects columns — both `pq.read_table(...)`
+   the full table and pass the schema through, adding `is_core` and `text`
+   (`upload_blocks.py:231`: `out_schema = pa.schema(list(ids.schema) + [pa.field('text', ...)])`).
+   The uploaded parquet is 32 master columns + `is_core` + `text` = the 34 that
+   `configs/data.yaml:153` already documents, and `record_id` is one of them. Confirmed against
+   the real upload logs, which cross-check `record_id` on every uploaded row:
+   `verify restore OK: rows=126,480,544 ... record_id cross-checked on all 126,480,544 rows`.
+   `data_files_template` points at `{subdir}/data/*.parquet`, the full-column tables — **not**
+   the 5-column `ids/` mirror (`doc_id, orig_doc_id, shard_id, row_in_shard, is_core`), which
+   has no `record_id` and which an earlier, abandoned upload script used
+   (`_archive_upload_ids_version.py.bak`).
+
+   **Cost to carry**, measured on real values, not estimated:
+
+   | representation | B/row | over 592M output rows | share of the ~371 GB deliverable |
+   |---|---:|---:|---:|
+   | JSONL, uncompressed (`out_root/raw/`) | 62.0 | 36.7 GB | — |
+   | JSONL + zstd (`out_root/raw/`) | 21.1 | 12.5 GB | 3.4% |
+   | parquet + zstd, string as-is (`shuffled/`) | 19.4 | 11.5 GB | **3.1%** |
+   | parquet + zstd, `binary(16)` packed UUID | 16.3 | 9.7 GB | 2.6% |
+
+   Both copies together add ~24 GB to a ~742 GB `out_root`, i.e. **3.2%**. Note the value is
+   duplicated across the two passes, exactly as `doc_id` already is.
+
+   **Implemented (round 9), additively.** `doc_id` unchanged; `record_id` added as a 12th
+   output key, `large_string`, read from the uploaded parquet's own column in `shard_arm`
+   and carried verbatim through the input shards, the JSONL rows, the Arrow schema, trim
+   and shuffle — all four agree, and a test asserts the `(doc_id, record_id)` pairing
+   survives into the shuffled parquet.
+
+   **Its role, stated so nobody mistakes it for a key.** `record_id` is a **repair path for
+   a `doc_id` shift**, not a join key. `doc_id` is a surrogate — the global row index into
+   the 600M master — so if that master were ever rebuilt with different inputs or ordering,
+   every `doc_id` would move and every downstream join would mis-resolve silently. Carrying
+   `record_id` makes that recoverable: the mapping can be re-derived by joining `record_id`
+   against the rebuilt master, with `payload_digest` breaking the rare ties. It cannot serve
+   as the key itself, because 396,969 of 600,000,000 rows (0.0662%) share one — a join on
+   `record_id` alone fans out 2:1 on ~397k documents and inflates row counts instead of
+   erroring. **Join on `doc_id`. Use `record_id` only to rebuild `doc_id` if it ever breaks.**
+
+   **Folded into the manifest fingerprint**, along with the rest of `output.keys`. Adding a
+   key does not renumber anything, so on the narrow reading of the fingerprint's job it does
+   not belong there. It belongs there on the broader one: a `.done` marker asserts a shard's
+   *output* is complete under the current schema, and after a schema change the rows behind
+   an old marker are not. Without the interlock, adding a key mid-run would leave finished
+   shards matching their markers and silently skipped, and the job would "complete" with some
+   rows carrying `record_id` and some not — surfacing only as nulls in the shuffled parquet,
+   long after the GPU time was spent. With it, the same mistake invalidates the markers
+   loudly. This landed before job 1, so it cost nothing.
+
+   **Disk.** Every quoted estimate was revised: `bytes_per_row_overhead` 235 → 297 (the
+   measured +62.0 B/row for the JSON field), one compressed copy 0.338 → 0.348 TiB, and
+   `out_root` 0.68 → 0.70 TiB for both copies. About +3.0%.

@@ -9,7 +9,7 @@ in full.
 
 Requires: PyYAML, pyarrow, numpy, zstandard, datasets. Exit 0 on success.
 """
-import json, os, random, shutil, sys, tempfile, time, types
+import contextlib, io, json, os, random, shutil, sys, tempfile, time, types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -75,6 +75,14 @@ def fake_open_dataset(cfg, a, streaming=False):
     if not getattr(fake_open_dataset, "omit_doc_id", False):
         # real datasets are required to carry doc_id (configs/data.yaml require_doc_id)
         cols["doc_id"] = pa.array(range(n), type=pa.int64())
+    if not getattr(fake_open_dataset, "omit_record_id", False):
+        # WARC-Record-ID, shaped exactly like the real column. Deliberately NOT unique:
+        # every 500th row repeats its predecessor's id, mirroring the 0.0662% duplication
+        # measured on the real 600M corpus, so anything that assumes uniqueness breaks here
+        # rather than in production.
+        rid = [f"<urn:uuid:{a.name[:8]:_<8}-0000-4000-8000-{(i - (i % 500 == 0 and i > 0)):012d}>"
+               for i in range(n)]
+        cols["record_id"] = pa.array(rid, type=pa.large_string())
     from datasets import Dataset
     return Dataset(pa.table(cols))
 D._open_dataset = fake_open_dataset
@@ -235,11 +243,27 @@ for arm in ["wrap-inspired","quality-first"]:
 p0 = sorted((cfg.raw_dir("quality-first","p1")).glob(f"part_*{cfg.shard_suffix}"))[0]
 rows0 = [r for r in D.iter_jsonl(p0)]
 n_s0 = sum(1 for r in rows0 if r["status"]==0)
-KEYS11 = {"doc_id","arm","prompt_id","source_text_sha1","rewritten_text",
-          "finish_reason","n_prompt_tokens","n_output_tokens","status",
-          "n_output_tokens_llama2","wrap_style"}
-expect(all(set(r)==KEYS11 for r in rows0), "output rows have exactly the 11 keys")
-expect(set(cfg.data["output"]["keys"])==KEYS11,
+# Driven off the config rather than a hardcoded list: the point of the check is that the
+# four layers (config, JSONL rows, Arrow schema, shuffle) agree, not that the count is 11.
+SCHEMA_KEYS = set(cfg.data["output"]["keys"])
+expect(all(set(r)==SCHEMA_KEYS for r in rows0),
+       f"output rows have exactly the {len(SCHEMA_KEYS)} keys of output.keys")
+expect("record_id" in SCHEMA_KEYS, "record_id is part of the output schema")
+expect(all(isinstance(r.get("record_id"), str) and r["record_id"] for r in rows0),
+       "every output row carries a non-empty record_id")
+_rid_in = {}
+for _ridp in sorted(cfg.shards_dir("quality-first").glob("part_*.parquet")):
+    _ridt = pq.read_table(_ridp, columns=["doc_id", "record_id"])
+    _rid_in.update(zip(_ridt.column("doc_id").to_pylist(),
+                       _ridt.column("record_id").to_pylist()))
+expect(all(r["record_id"] == _rid_in[r["doc_id"]] for r in rows0),
+       "record_id in the output matches the input shard for the same doc_id (verbatim)")
+# The property that makes it a repair path and NOT a key: it is deliberately not unique.
+_dups = len(_rid_in) - len(set(_rid_in.values()))
+expect(_dups > 0,
+       f"the fixture reproduces real record_id duplication ({_dups} dupes) -- "
+       "nothing may assume uniqueness")
+expect(set(cfg.data["output"]["keys"])==set().union(*(set(r) for r in rows0)),
        "configs/data.yaml output.keys matches what is actually written")
 expect(all(r["wrap_style"]=="" for r in rows0),
        "wrap_style is the empty string for a non-wrap job")
@@ -386,6 +410,29 @@ docs = [d for f in f0 for d in pq.read_table(f).column("doc_id").to_pylist()]
 expect(sorted(docs)==list(range(ROWS["wrap-inspired"])), "shuffle is a complete permutation")
 expect(docs != sorted(docs), "shuffle actually reordered the rows")
 expect(SH.shuffle_job(cfg, jobs[0], log=lambda m: None) is None, "shuffle is resumable")
+
+# ---- record_id survives all four layers, ending in the SHUFFLED parquet ----
+# config -> JSONL rows -> Arrow schema -> shuffled output. The suite already proves the
+# first two; this closes the last two, which is where a new key silently goes missing.
+_shdir = cfg.shuffled_dir(jobs[0].arm, jobs[0].prompt.id)
+_shp = sorted(_shdir.glob("part_*.parquet"))
+expect(bool(_shp), f"shuffled output exists for {jobs[0].job_id}")
+_sht = pq.read_table(_shp[0])
+expect(list(_sht.schema.names) == list(cfg.data["output"]["keys"]),
+       f"shuffled parquet schema == output.keys, in order ({_sht.num_columns} cols)")
+expect(_sht.schema.field("record_id").type == pa.large_string(),
+       f"record_id is large_string in the shuffled parquet (got {_sht.schema.field('record_id').type})")
+_shrid = _sht.column("record_id").to_pylist()
+expect(all(isinstance(x, str) and x.startswith("<urn:uuid:") for x in _shrid),
+       "every shuffled row carries a well-formed record_id -- no nulls, no drops")
+# and the value still pairs with the right doc_id after the shuffle reorders everything
+_shmap = dict(zip(_sht.column("doc_id").to_pylist(), _shrid))
+_srcmap = {}
+for _q in sorted(cfg.shards_dir(jobs[0].arm).glob("part_*.parquet")):
+    _qt = pq.read_table(_q, columns=["doc_id", "record_id"])
+    _srcmap.update(zip(_qt.column("doc_id").to_pylist(), _qt.column("record_id").to_pylist()))
+expect(all(_srcmap[k] == v for k, v in _shmap.items()),
+       "(doc_id, record_id) pairing survives trim + shuffle intact")
 
 # ================================================================= 8. claiming
 hdr("8. dynamic shard claiming on a simulated heterogeneous fleet")
@@ -914,6 +961,53 @@ except SystemExit:
 expect(_ok_fleet, "6.5: a fleet within the ceiling passes")
 expect(any("across the declared fleet" in m for m in _msgs),
        "6.5: and the fleet-wide ratio is reported so it is auditable")
+
+# ================================================================= round 9
+hdr("7: record_id -- schema interlock and input guard")
+
+import copy as _c9
+# The fingerprint decision: output.keys is folded in, so adding or removing a key
+# invalidates every .done marker instead of silently mixing two schemas in one job.
+_fp_base = D.compute_fingerprint(cfg, "deadbeef", "dataset")
+_cfg_k = _c9.deepcopy(cfg); _cfg_k.data = _c9.deepcopy(cfg.data)
+_cfg_k.data["output"]["keys"] = [k for k in cfg.data["output"]["keys"] if k != "record_id"]
+expect(D.compute_fingerprint(_cfg_k, "deadbeef", "dataset") != _fp_base,
+       "7.1: dropping record_id from output.keys CHANGES the manifest fingerprint")
+_cfg_o = _c9.deepcopy(cfg); _cfg_o.data = _c9.deepcopy(cfg.data)
+_cfg_o.data["output"]["keys"] = list(reversed(cfg.data["output"]["keys"]))
+expect(D.compute_fingerprint(_cfg_o, "deadbeef", "dataset") != _fp_base,
+       "7.1: so does reordering them -- the shuffled parquet's column order follows")
+expect(D.compute_fingerprint(cfg, "deadbeef", "dataset") == _fp_base,
+       "7.1: and an unchanged schema is stable (no spurious invalidation)")
+
+# The input guard: record_id is declared in output.keys, so a dataset without it must
+# stop with a named error rather than emit empty strings.
+fake_open_dataset.omit_record_id = True
+_cfg_r = _c9.deepcopy(cfg); _cfg_r.paths = dict(cfg.paths)
+_cfg_r.paths["data_root"] = WORK / "norecid"
+_err = io.StringIO()
+try:
+    with contextlib.redirect_stderr(_err):
+        D.shard_arm(_cfg_r, "quality-first", log=lambda m: None)
+    _guarded = False
+except SystemExit:
+    _guarded = True
+fake_open_dataset.omit_record_id = False
+expect(_guarded, "7.2: a dataset with NO record_id column is REJECTED, not silently blanked")
+_gm = _err.getvalue()
+expect("record_id" in _gm and "output.keys" in _gm,
+       "7.2: the error names the column and the config key that requires it")
+expect("metadata" in _gm,
+       "7.2: and says not to parse it out of the metadata blob")
+
+# Its role, asserted where someone will read it.
+_dy = (REPO / "configs" / "data.yaml").read_text()
+expect("NOT A UNIQUE KEY" in _dy,
+       "7.3: data.yaml states plainly that record_id is not a unique key")
+expect("0.0662%" in _dy and "599,603,031" in _dy,
+       "7.3: with the measured duplication rate and the exact distinct count")
+expect("payload_digest" in _dy,
+       "7.3: and names payload_digest as the tie-breaker for the repair path")
 
 # ================================================================= summary
 hdr("SUMMARY")

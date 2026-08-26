@@ -531,6 +531,8 @@ def c10_smoke(cfg, args) -> bool:
         texts = tbl.column(cfg.text_column).to_pylist()
         doc_ids = tbl.column("doc_id").to_pylist()
         shas = tbl.column("source_text_sha1").to_pylist()
+        rec_ids = (tbl.column("record_id").to_pylist()
+                   if "record_id" in tbl.column_names else [""] * len(texts))
 
         drop, _ = resolve_drop_threshold(job.prompt, cfg.max_model_len, cfg.max_tokens)
         # Shard 0, so the smoke test exercises the same style draw the real run will make
@@ -553,6 +555,7 @@ def c10_smoke(cfg, args) -> bool:
             "finish_reason": res.finish_reason[i], "n_prompt_tokens": prep.n_in_list[i],
             "n_output_tokens": res.n_output_tokens[i], "status": res.status[i],
             "n_output_tokens_llama2": n_l2[i],
+            "record_id": rec_ids[i],
             "wrap_style": smoke_styles[i] if smoke_styles else "",
         } for i in range(len(texts))]
 

@@ -41,7 +41,7 @@ yours to process. Full explanation: `docs/DESIGN_DELTA.md`.
 
 **Scale.** 360 B source tokens × 2 passes = **720 B input tokens** through the GPUs,
 producing **~261 B output tokens** (measured, not assumed — see `docs/DESIGN_DELTA.md`
-§5). That is roughly **1.1 TiB** of JSONL uncompressed, **~0.34 TiB** with the default
+§5). That is roughly **1.16 TiB** of JSONL uncompressed, **~0.35 TiB** with the default
 zstd. Wall-clock depends entirely on your GPUs — `preflight.py` prints a per-GPU KV-cache
 estimate, `06_calibrate.py` projects the whole run from a measured rate, and every job logs
 a live tok/s and ETA. Assume days-to-weeks, and assume **it will be interrupted many
@@ -94,7 +94,7 @@ easier to get right the first time than to move later. See §3.5.
 | `repo_root` | absolute path to this clone | either | `cd` into the repo, run `pwd` |
 | `model_dir` | where model weights land, ~20 GB | **node-local** | any local disk with room: `df -h <dir>` |
 | `data_root` | downloaded + re-sharded inputs | **shared** | needs roughly 2× the raw dataset size; `preflight.py` prints the real number |
-| `out_root` | rewritten output — **the big one** | **shared** | ~0.65 TiB with zstd, ~2.2 TiB without — **two** copies, see below |
+| `out_root` | rewritten output — **the big one** | **shared** | ~0.70 TiB with zstd, ~2.3 TiB without — **two** copies, see below |
 | `tmp_root` | shuffle scratch | **node-local** | must be **fast local** disk, not NFS/Lustre; ~1.2× the largest single job's output |
 | `log_root` | per-worker logs | **shared** | small; `"${repo_root}/logs"` is fine |
 | `hf_cache` | `HF_HOME` | **node-local** | put it with `model_dir`; **not** your home directory if it has a quota |
@@ -419,8 +419,17 @@ Ten directories, one per (arm, prompt):
 | rows per file | 500,000 (the last file of each job is the remainder) |
 | files | ~1,184 in total across the ten jobs |
 | rows | ~592 M in total — 2 × 295,903,983, one row per document per prompt |
-| columns | the 11 in `configs/data.yaml` `output.keys`, including `doc_id` and `wrap_style` |
-| size | ≈0.3 TiB for `shuffled/` |
+| columns | the 12 in `configs/data.yaml` `output.keys`, including `doc_id`, `record_id` and `wrap_style` |
+| size | ≈0.35 TiB for `shuffled/` |
+
+> **The two identifier columns are not interchangeable.** `doc_id` is the join key: it is
+> unique, and it is what joins a rewritten row back to the input corpus and to the other 32
+> columns on the Hub. `record_id` is the source document's WARC-Record-ID, carried so that a
+> `doc_id` shift is *repairable* — if the upstream master corpus were ever rebuilt and the
+> row indices moved, the mapping can be re-derived by joining `record_id` against the new
+> master, with `payload_digest` breaking ties. **It is not a unique key**: 0.0662% of source
+> documents share a `record_id` (the same WARC record sampled twice), so joining on it alone
+> silently fans out 2:1 on ~397k documents instead of erroring. Join on `doc_id`.
 
 Each job's directory also holds `_shuffle.done`, a small JSON marker recording the row
 count, shard count and seed. It is the proof the job completed and the reason a re-run
@@ -428,7 +437,7 @@ skips it — **do not delete it**.
 
 **`<out_root>/raw/` is also still there**, and is roughly the same size again. The trim
 runs in place, so `raw/` holds the same rows in JSONL form along with every `.done`
-sidecar recording which GPU produced which shard. Budget ≈0.65 TiB for `out_root` overall,
+sidecar recording which GPU produced which shard. Budget ≈0.70 TiB for `out_root` overall,
 and do not clear `raw/` without asking Wytro (§6 item 9).
 
 If you ever do need to upload, everything is still in the repo: set `upload.enabled: true`
@@ -442,7 +451,7 @@ without the other is a hard error rather than a late crash.
 
 Agent: **do not decide these yourself.** Stop, ask, and wait.
 
-1. **Where the data goes.** `out_root` needs up to ~1.1 TiB and `data_root` a comparable
+1. **Where the data goes.** `out_root` needs up to ~0.70 TiB (zstd) and `data_root` a comparable
    amount. Do not pick a filesystem, quota, or scratch area on his behalf, and do not
    "free up space" by deleting anything.
 2. **How many GPUs to take.** `num_gpus` decides how much of the machine this consumes,
@@ -574,6 +583,15 @@ A hard list. Each item exists because doing it silently invalidates the experime
 12. **Do not change `sharding.shard_target_rows` after job 1 has started.** It feeds the
     manifest fingerprint; changing it renumbers `doc_id` and invalidates every `.done`
     marker, i.e. throws the run away.
+12b. **Do not change `output.keys` in `configs/data.yaml`.** It also feeds the manifest
+    fingerprint, deliberately: a `.done` marker asserts that a shard's output is complete
+    under the current schema, and after a key is added or removed the rows behind an old
+    marker are neither. Without that interlock, adding a key mid-run would leave finished
+    shards silently skipped and the job would "complete" with some rows carrying the new
+    column and some not — visible only as nulls in the shuffled parquet, long after the
+    GPU time is spent. **`record_id` was added in round 8, deliberately and before job 1,
+    when the cost is zero.** After job 1 the same change means re-preparing the data and
+    regenerating every shard.
 13. **Do not parallelise jobs to save time.** Each job already uses every GPU. Two at once
    means two engines each trying to reserve 85% of the same card. The `flock` in
    `03_run_job.sh` prevents it — do not remove it.

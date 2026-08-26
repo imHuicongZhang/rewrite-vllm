@@ -190,6 +190,7 @@ Generated with `{cfg.vllm['model']['repo_id']}` under vLLM.
 | `status` | `0` dropped (too long, never generated) · `1` truncated at the output cap · `2` clean stop |
 | `n_prompt_tokens`, `n_output_tokens` | Qwen tokenizer |
 | `n_output_tokens_llama2` | Llama-2 tokenizer — **use this one for token budgeting**, and add 1 per document for BOS |
+| `record_id` | the WARC-Record-ID of the source document, e.g. `<urn:uuid:4038e004-...>`, verbatim from the input dataset. **Not a unique key** — 0.0662% of source documents share one (the same WARC record sampled twice), so a join on it alone fans out. Use `doc_id` to join; `record_id` exists so a `doc_id` shift is repairable against a rebuilt master, with `payload_digest` breaking ties |
 | `wrap_style` | which of `easy`/`hard`/`wiki`/`qa` produced this row. Populated only for `wrap-inspired`'s styled pass; the empty string everywhere else |
 
 Rows with `status != 2` are present but were not cleanly generated. Filter to `status == 2`

@@ -243,6 +243,11 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
         texts = table.column(cfg.text_column).to_pylist()
         doc_ids = table.column("doc_id").to_pylist()
         shas = table.column("source_text_sha1").to_pylist()
+        # Carried through from the input shard, which got it from the uploaded dataset.
+        # Absent only for shards prepared before round 8 added it; those are invalidated by
+        # the manifest fingerprint anyway, so this fallback should never be reached.
+        rec_ids = (table.column("record_id").to_pylist()
+                   if "record_id" in table.column_names else [""] * n_rows)
 
         t0 = time.perf_counter()
         # Hold a liveness signal on the claim for the whole shard. The main thread is
@@ -269,6 +274,9 @@ def run_worker(cfg: Config, job: JobSpec, worker_id: int, num_workers: int,
         for j in range(n_rows):
             lines.append(json.dumps({
                 "doc_id": doc_ids[j],
+                # WARC-Record-ID of the source document. A repair path for a doc_id shift,
+                # NOT a unique key -- ~0.066% of documents share one. See data.yaml.
+                "record_id": rec_ids[j],
                 "arm": job.arm,
                 "prompt_id": job.prompt.id,
                 "source_text_sha1": shas[j],

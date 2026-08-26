@@ -2051,3 +2051,304 @@ GUIDE §3.6.
 | 2 | Trim every arm's output to 30B and assemble `20B core + 30B rewritten = 50B` per arm | Wytro |
 | 3 | Read `06_calibrate.py`'s tok/doc cross-check on job 1: it settles the `r` transfer, and `quality-first`'s +19.6% headroom is the number at risk | Wytro |
 | 4 | Arrange delivery of the finished data — out of this pipeline's scope by design | Wytro |
+
+---
+
+# Addendum — 2026-08-26 (later): round 8, the document identifier — VERIFICATION ONLY
+
+**Nothing was changed.** No code, no schema, no config. `configs/data.yaml`'s
+`output.keys` is untouched and still the 11 keys round 7 left. This round establishes facts
+and hands the decision back.
+
+## §1 What identifier columns exist
+
+**First, a count correction.** The master corpus has **32** columns, not 34. The uploaded
+dataset has 34 = the 32 master columns + `is_core` + `text`, which is what
+`configs/data.yaml:153` already says. Verified by reading the on-disk schema of
+`6_merged_clean/part_00000.parquet` and against `config_600m.py:169-182`.
+
+Of those 32, the ones that could conceivably identify a document:
+
+| column | dtype | example (real, row 0 of shard 0) |
+|---|---|---|
+| `record_id` | `string` | `<urn:uuid:63e688d6-238c-43a2-89d2-dcbc9e4f71dc>` |
+| `url` | `string` | `http://cccscholarships.blogspot.com/2008/06/scholarships-can-help-you-through.html` |
+| `payload_digest` | `string` | `sha1:RWBEZ7DBLT5ERTA6VNOJ3PWCT7NGPXGI` |
+| `crawl` | `string` | `CC-MAIN-2018-09` |
+| `shard` | `string` | `global-shard_01_of_10/local-shard_8_of_10/shard_00001392_processed.jsonl.zstd` |
+| `line_no` | `int64` | `15741` |
+| `warc_date` | `timestamp[us]` | `2018-02-21 19:21:15` |
+| `warc_ip` | `string` | `172.217.7.225` |
+| `metadata` | `string` | JSON blob: `WARC-Block-Digest`, `WARC-Concurrent-To`, `WARC-Date`, `WARC-IP-Address`, … |
+| `doc_id` / `orig_doc_id` | `int64` | `0` / `0` — the surrogate, identical to each other |
+| `shard_id` / `row_in_shard` | `int16` / `int32` | `0` / `0` — position in the master |
+
+`doc_id` is confirmed surrogate: `materialize_master.py:114`,
+`doc_id = np.arange(lo, lo + n, dtype=np.int64)`.
+
+## §2 Which are unique — measured, not reasoned
+
+Measured **exactly over all 600,000,000 rows** for `record_id`, by packing each UUID to its
+16 raw bytes (vectorised, validated against Python's `uuid` parser) and taking a true
+distinct count. Not a sample.
+
+```
+record_id   EXACT distinct: 599,603,031 / 600,000,000     duplicate rows: 396,969  (0.0662%)
+```
+
+Per-shard, across 12 shards spread over the corpus (7.3M rows):
+
+| column | distinct, typical shard | reading |
+|---|---:|---|
+| `record_id` | 100.0000% in 10 of 12 shards | near-unique; see the exception below |
+| `payload_digest` | 99.998% | content hash — collides on duplicate text by design |
+| `url` | 99.99% | not an identifier; the same page is recrawled |
+| `crawl` | **0.0179%** — 89 distinct in 497,055 rows | **a snapshot label** |
+
+**The `CC-MAIN-2026-...` recollection was `crawl`, and the concern about it was right.** It
+is a Common Crawl snapshot label shared by billions of documents — 89 distinct values across
+a half-million-row shard. Switching the join key to it would be a severe regression, and it
+is not a candidate.
+
+**`record_id` is near-unique but is NOT a primary key**, and this is the finding that shapes
+the recommendation. 396,969 rows share a `record_id` with another row. Two of the twelve
+sampled shards showed it (440 at 99.9319%, 990 at 99.9966%). Inspecting shard 440: 1,179
+duplicated ids, **all at multiplicity exactly 2**, and each pair is the *same WARC record*
+drawn twice from different DCLM source shards — identical `url`, `payload_digest`, `crawl`
+and `text_len`, differing only in `shard` / `line_no` / `doc_id`:
+
+```
+<urn:uuid:fe5865bd-c8ac-4a45-bde2-28d0cef5a7b4>  appears 2x
+  doc_id=236776167  shard_00000075  line 6508  url=http://betabeat.com/tag/period-tracker/
+  doc_id=237006013  shard_00000267  line 5492  url=http://betabeat.com/tag/period-tracker/
+```
+
+These are genuine duplicate documents in the upstream sample, **not id collisions between
+different documents** — which is the benign reading, but it still means `record_id` cannot
+replace `doc_id`. `doc_id` is a true primary key by construction; `record_id` is not.
+
+## §3 Is it already uploaded? YES — no re-upload needed
+
+**This is the cheap case.** Neither stage of the upload path projects columns:
+
+- `materialize_blocks.py:87` — `tbl = pq.read_table(C.master_path(i))`, full read; then only a
+  row filter and `append_column('is_core', ...)`. Its docstring: *"the master has 32 columns
+  and no `text` column … so 'all columns except text' is simply all master columns; nothing
+  has to be dropped."*
+- `upload_blocks.py:214` — `tbl = pq.read_table(src_part)`, full read; `:222` filters **rows**
+  only; `:231` — `out_schema = pa.schema(list(ids.schema) + [pa.field('text', pa.large_string())])`.
+
+There is no column list anywhere in either file. `record_id` is not merely present, it is
+**mandatory**: `upload_blocks.py:215-220` aborts if it is missing, because every uploaded row
+is positionally cross-checked against the source on it.
+
+Confirmed against the actual upload run logs, first-hand:
+
+```
+verify restore OK: rows=126,480,544 nulls=0 empty=0 doc_id set identical,
+                   record_id cross-checked on all 126,480,544 rows
+verify upload OK:  143 files present, all sizes match (202.4G)
+```
+
+— and the same for all six directories, with row counts matching `data.yaml`'s declared
+`docs` exactly (37,511,431 / 35,304,301 / 33,381,230 / 63,226,477 / 126,480,544 / 17,909,083).
+
+`configs/data.yaml`'s `data_files_template: "{subdir}/data/*.parquet"` points at those
+full-column tables. It is **not** the 5-column `ids/` mirror (`doc_id, orig_doc_id, shard_id,
+row_in_shard, is_core`), which carries no `record_id` and which an earlier abandoned upload
+script used (`_archive_upload_ids_version.py.bak`).
+
+**Caveat on the evidence.** There is no HF token on this machine and the repo is gated, so
+this rests on the upload code plus the upload run logs, not on reading the Hub schema
+directly. The logs are strong — a per-row `record_id` cross-check is only possible on parts
+that contain the column, and those are the parts that were pushed — but a one-line
+confirmation against the Hub is worth doing before committing to the change. Note also that
+the local `<block>/data/` directories no longer exist; the Hub copy is the only place the
+full-column tables now live.
+
+## §4 What it costs to carry
+
+Measured on 497,055 real `record_id` values, not estimated:
+
+| representation | B/row | over 592M rows | share of the ~371 GB deliverable |
+|---|---:|---:|---:|
+| JSONL, uncompressed (`out_root/raw/`) | 62.0 | 36.7 GB | — |
+| JSONL + zstd (`out_root/raw/`) | 21.1 | 12.5 GB | 3.4% |
+| **parquet + zstd, string as-is (`shuffled/`)** | **19.4** | **11.5 GB** | **3.1%** |
+| parquet + zstd, `binary(16)` packed UUID | 16.3 | 9.7 GB | 2.6% |
+
+Both copies together: ~24 GB on a ~742 GB `out_root` — **3.2%**. UUIDs are ~16 bytes of real
+entropy, so zstd cannot do much; the floor is the packed form at 16.3 B/row, and stripping
+the `<urn:uuid:` wrapper saves nothing (19.8 vs 19.4 — the wrapper is a constant that
+compresses away, and removing it costs the offsets). Recommend keeping the string verbatim:
+3.1% for a value that stays greppable and matches the source byte for byte.
+
+## §5 Recommendation
+
+**Agreed — carry it, additively, and decide before job 1.** Keep `doc_id` exactly as it is:
+it is folded into the manifest fingerprint, it is a true primary key, it is cheap, and it
+works today. Add `record_id` as a 12th output column.
+
+Three reasons the case is stronger than "nice to have":
+
+1. **The failure mode being insured against is silent.** A regenerated master shifts every
+   `doc_id`, and nothing downstream would raise — joins would resolve to the wrong documents
+   and produce plausible results. That is the class of bug worth 3.1% of disk.
+2. **It is nearly free, and free *now*.** No re-upload, no re-selection, ~3% of the
+   deliverable, and the pipeline already reads the parquet that contains it. After job 1 it
+   means re-preparing everything.
+3. **It costs nothing to ignore.** A downstream consumer that does not want it can drop the
+   column.
+
+**One correction to the framing, and it matters.** The proposal was described as adding a
+"natural per-document identifier … so the join survives independently of the master".
+`record_id` does not quite deliver that on its own: at 0.0662% duplication it identifies a
+*web record*, not a *row*, so a join on `record_id` alone fans out 2:1 on ~397k documents.
+What it actually buys is the ability to **detect and repair** a `doc_id` shift — re-derive
+the mapping by joining `record_id` (plus `payload_digest` or `url` to break the rare ties)
+against a rebuilt master. That is still the property worth having, and it is worth stating
+accurately so nobody later treats `record_id` as a unique key and is surprised.
+
+**If a strictly unique natural key is wanted**, the pair `(record_id, payload_digest)` or the
+triple with `shard`/`line_no` would do it — but `shard`/`line_no` are positional in DCLM and
+inherit the same regeneration fragility as `doc_id`, so they add little. My advice is
+`record_id` alone, documented as near-unique with the measured rate.
+
+**Not recommended:** `crawl` (a snapshot label — see §2), `url` alone, or replacing `doc_id`
+with anything.
+
+## §6 What was and was not executed
+
+**Ran:** exact 128-bit distinct count over all 1,103 master shards / 600,000,000 rows
+(~8 min read + sort); per-shard distinct counts for `record_id`, `payload_digest`, `url`,
+`crawl` on 12 shards spread over the corpus; duplicate-group inspection on shard 440;
+compression measurements on 497,055 real `record_id` values in four representations; read of
+`materialize_master.py`, `config_600m.py`, `materialize_blocks.py`, `upload_blocks.py`,
+`select_600m.py`, `_archive_upload_ids_version.py.bak`; the six upload verification logs.
+
+**Not run:** any read of the Hub — no token on this machine and the repo is gated (see §3).
+
+**Changed: nothing.** No code, no schema, no config, no test. `git diff` covers only
+`docs/DESIGN_DELTA.md` (open question 7) and this file.
+
+---
+
+# Addendum — 2026-08-26 (final): round 9, record_id implemented
+
+Wytro confirmed `record_id` on the Hub from the Data Studio view — the column is there with
+`<urn:uuid:...>` values matching `WARC-Record-ID` in `metadata` — and approved the round-8
+recommendation. This round implements it. **Additive: `doc_id` is untouched.**
+
+**Nothing on the generation path changed in substance** — `prompts/`, `engine.py`,
+`configs/vllm.yaml`, `wrap_styles.py`, `postprocess.py`'s trim rules and `shuffle.py`'s
+shuffle internals are byte-identical to round 7. `run_rewrite.py` gains one key in the
+output row; that is the whole of its diff.
+
+## §1 Two identifiers rejected, and why they are the same mistake
+
+**`WARC-Warcinfo-ID` is out.** It identifies a WARC *file*, so every record written into
+that file shares it — the same class of error as `crawl`, which labels a crawl snapshot
+shared by billions of documents. Neither is a document identifier. It is also unnecessary:
+the `record_id` column already carries exactly the `WARC-Record-ID` value, so **nothing is
+parsed out of the `metadata` blob**. `shard_arm` reads the column directly, and the error
+it raises when the column is absent says so explicitly, because parsing `metadata` is the
+obvious wrong move for whoever hits it next.
+
+**`record_id` does not replace `doc_id`.** The round-8 measurement settles it: 396,969 of
+600,000,000 rows (0.0662%) share a `record_id`, so a join on it fans out 2:1 on ~397k
+documents — silently inflating row counts rather than erroring, which is worse than
+failing. `doc_id` is unique by construction. Implemented exactly as recommended.
+
+## §2 What was built
+
+| layer | change |
+|---|---|
+| `configs/data.yaml` | `record_id` added to `output.keys` (12 keys), positioned next to `doc_id`; a long comment on its role, its measured non-uniqueness, and the two rejected candidates |
+| `src/rewrite/data.py` — `shard_arm` | reads the `record_id` column from the uploaded parquet, buffers it, writes it into each input shard; **hard `stop()`** if `output.keys` declares it and the dataset lacks it |
+| `src/rewrite/data.py` — `compute_fingerprint` | `output.keys` folded in — see §3 |
+| `src/rewrite/data.py` — `jsonl_to_table` | `record_id` → `pa.large_string()` |
+| `src/rewrite/run_rewrite.py` | carries it from the input shard into every output JSONL row |
+| `src/rewrite/postprocess.py` | **no change needed** — `trim_shard` mutates row dicts in place, so it passes unknown keys through unchanged. Verified by test, not assumed |
+| `src/rewrite/shuffle.py` | **no change needed** — it takes its key list from `cfg.data["output"]["keys"]`. Verified by test |
+| `scripts/preflight.py` | the smoke-test row carries it, so the end-to-end check exercises the real schema |
+| `scripts/05_upload_to_hf.py` | dataset-card column table documents it, including the not-a-key warning |
+
+The four layers the brief asked to agree — config, JSONL rows, Arrow schema, trim/shuffle —
+now do, and the test asserts the `(doc_id, record_id)` pairing survives *into the shuffled
+parquet*, which is where a newly added key would otherwise go missing silently.
+
+## §3 The fingerprint decision: folded in, and why
+
+**`output.keys` is now part of the manifest fingerprint.**
+
+The argument against is real and worth stating: the fingerprint's documented job is to catch
+anything that **renumbers rows**, and adding `record_id` renumbers nothing — `doc_id` and the
+text are untouched, and the generated text for a given shard would be byte-identical either
+way. On that reading it does not belong.
+
+It belongs on the broader reading, which is what a `.done` marker actually asserts: *shard N's
+output is complete and correct*. After a schema change, the rows behind an old marker are
+neither. Without the interlock, adding a key mid-run would leave every already-generated shard
+matching its marker, silently skipped, and the job would report DONE with some rows carrying
+`record_id` and some not. That surfaces as nulls in the shuffled parquet — after the GPU time
+is spent, and after row-conservation checks have passed, because the row *count* is still
+right. With the interlock it fails loudly at data prep instead.
+
+Folding in the whole key list rather than a `record_id`-specific flag also covers the next
+schema change, whatever it is. Reordering counts too, deliberately: the shuffled parquet's
+column order follows `output.keys`, so a reorder changes the artifact.
+
+**It cost nothing to add today** — this lands before job 1, with no data generated. After job 1
+the same change would mean re-preparing the data and regenerating every shard, which is
+precisely the asymmetry `GUIDE §6` item 12b now warns about.
+
+## §4 Disk — every quoted estimate revised
+
+`bytes_per_row_overhead` 235 → **297**. The +62 is measured, not assumed: 497,055 real
+`record_id` values serialised as a JSON field average exactly 62.0 B/row uncompressed
+(`"record_id":"<urn:uuid:...>",` = 12 + 49 + 1).
+
+| figure | before | after |
+|---|---|---|
+| raw JSONL, one copy | 1.13 TiB | **1.16 TiB** |
+| zstd, one copy | 0.338 TiB | **0.348 TiB** |
+| `out_root` (raw/ + shuffled/) | 0.68 TiB | **0.70 TiB** |
+| `cluster.yaml` header figure | ~2.4 TB / ~0.7 TB | **~2.6 TB / ~0.77 TB** |
+
+Updated in `configs/data.yaml`, `configs/cluster.yaml`, and `GUIDE` §1, §2.1, §3.6 and §4.
+`preflight.py` check 9 derives from `bytes_per_row_overhead`, so it follows automatically and
+still gates `out_root` on two copies. **+3.0%**, against the 3.1% projected in round 8.
+
+Compressed, the column is far cheaper than 62 B: 21.1 B/row as JSONL+zstd, 19.4 B/row as
+parquet+zstd, because the key name and the `<urn:uuid:` wrapper are constants and only the
+32 hex digits carry entropy — about 16 bytes of it.
+
+## §5 What was and was not executed
+
+**Ran, green:** `test_integration.py` — full suite, 0 failed, including **17 new checks**:
+the 12-key schema now driven off `output.keys` rather than a hardcoded list, `record_id`
+non-empty and byte-identical to the input shard for the same `doc_id`, the shuffled parquet's
+schema matching `output.keys` in order with `record_id` as `large_string`, the
+`(doc_id, record_id)` pairing intact after trim + shuffle, the fingerprint changing on key
+add/remove/reorder and stable otherwise, and the missing-column guard rejecting rather than
+blanking. `test_wrap_styles` 33/33. `compileall` over `src scripts tests`; all three YAML
+configs parse; `bash -n` on every shell script.
+
+**The test fixture now reproduces the real defect**: its synthetic `record_id` values repeat
+every 500th row, so anything that assumes uniqueness fails in the test rather than in
+production. A check asserts the duplication is present.
+
+**Not run:** `test_trim_parity` / `test_shuffle_parity` (need `--source-root`); `preflight.py`
+end to end and `verify_prompt_parity.py` (need filled cluster paths); no GPU work. Nothing in
+the trim or shuffle *logic* changed — both files' diffs are zero for `postprocess.py` and
+`shuffle.py`.
+
+## §6 Readiness list — unchanged except the disk figure
+
+Round 7's §9 list stands. The only edit: preflight check 9 now prints **~0.70 TiB** for
+`out_root` rather than ~0.65 TiB, and the finished data at
+`out_root/shuffled/<arm>/<prompt_id>/part_NNNNN.parquet` carries **12 columns**, not 11.
+
+One thing for whoever consumes the corpus, worth repeating because it is the single most
+likely misuse: **join on `doc_id`.** `record_id` is there to rebuild `doc_id` if the upstream
+master is ever regenerated — not to join on. It is not unique.
